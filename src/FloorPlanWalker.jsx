@@ -158,6 +158,36 @@ export default function FloorPlanWalker() {
   // squared walls used for the 3D build and the editor's "after" preview; raw walls stay editable
   const tidied = useMemo(() => (tidy ? tidyWalls(walls) : walls), [tidy, walls]);
 
+  // ---- undo history ----
+  // Each entry snapshots the editable state BEFORE a discrete action. Every update is immutable
+  // (new arrays/objects), so we can store references cheaply without deep-copying.
+  const historyRef = useRef([]);
+  const [canUndo, setCanUndo] = useState(false);
+  const pushHistory = useCallback(() => {
+    const h = historyRef.current;
+    h.push({ walls, openings, furniture, stairs, rooms, scale, ceiling });
+    if (h.length > 60) h.shift();
+    setCanUndo(true);
+  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]);
+  const undo = useCallback(() => {
+    const s = historyRef.current.pop();
+    if (!s) return;
+    setWalls(s.walls); setOpenings(s.openings); setFurniture(s.furniture);
+    setStairs(s.stairs); setRooms(s.rooms); setScale(s.scale); setCeiling(s.ceiling);
+    setCanUndo(historyRef.current.length > 0);
+  }, []);
+  // Ctrl/Cmd+Z in the editor (ignore while typing in a field)
+  useEffect(() => {
+    const onKey = (e) => {
+      if (stage !== "editor" || !(e.metaKey || e.ctrlKey) || e.shiftKey) return;
+      if (e.key !== "z" && e.key !== "Z") return;
+      if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+      e.preventDefault(); undo();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo, stage]);
+
   // ---- image intake (downscale to a consistent working resolution) ----
   const ingest = useCallback((file) => {
     setError(null);
@@ -175,6 +205,7 @@ export default function FloorPlanWalker() {
         setImg({ url: c.toDataURL("image/jpeg", 0.9), w, h });
         setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]); setScale(null);
         setCurrentPlanId(null); setCurrentName(""); setSaveStatus(""); // a fresh photo is a new (unsaved) plan
+        historyRef.current = []; setCanUndo(false);
       };
       im.src = e.target.result;
     };
@@ -259,6 +290,7 @@ export default function FloorPlanWalker() {
     ]);
     setScale({ pixelsPerUnit: 1024 / 12, unit: "m" }); // assume 12 m wide
     setCurrentPlanId(null); setCurrentName(""); setSaveStatus("");
+    historyRef.current = []; setCanUndo(false);
     setStage("editor");
   }, []);
 
@@ -295,6 +327,7 @@ export default function FloorPlanWalker() {
     setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]);
     setScale({ pixelsPerUnit: PXFT, unit: "ft" }); // 1 square = 1 ft, baked in
     setCurrentPlanId(null); setCurrentName(""); setSaveStatus("");
+    historyRef.current = []; setCanUndo(false);
     setStage("editor");
   }, []);
 
@@ -329,6 +362,7 @@ export default function FloorPlanWalker() {
     setFurniture(remap(p.furniture)); setStairs(remap(p.stairs)); setRooms(remap(p.rooms));
     setScale(p.scale || null); setCeiling(p.ceiling ?? CEILING_FT_DEFAULT); setTidy(p.tidy ?? true);
     setCurrentPlanId(entry.id); setCurrentName(entry.name); setSaveStatus(""); setError(null);
+    historyRef.current = []; setCanUndo(false);
     setStage(walk && (p.walls || []).length >= 3 ? "walk" : "editor");
   }, []);
 
@@ -366,6 +400,7 @@ export default function FloorPlanWalker() {
             ceiling={ceiling} setCeiling={setCeiling}
             error={error} onRotate={rotatePlan}
             savedName={currentName} onSave={savePlan} saveStatus={saveStatus}
+            onUndo={undo} canUndo={canUndo} onPushHistory={pushHistory}
             onWalk={() => setStage("walk")}
             onBack={() => { setStage("upload"); }}
           />
@@ -521,14 +556,14 @@ function Analyzing() {
 }
 
 // ================= 2D EDITOR =================
-function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRotate, savedName = "", onSave, saveStatus = "", onWalk, onBack }) {
+function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRotate, savedName = "", onSave, saveStatus = "", onUndo, canUndo = false, onPushHistory, onWalk, onBack }) {
   const canvasRef = useRef(null);
   const [saving, setSaving] = useState(false);          // inline "name this plan" panel open?
   const [nameDraft, setNameDraft] = useState(savedName); // editable name in the Save panel
   const wrapRef = useRef(null);
-  const tf = useRef({ s: 1, ox: 0, oy: 0 });      // plan→screen transform (fit × user zoom/pan)
+  const tf = useRef({ s: 1, ox: 0, oy: 0, cos: 1, sin: 0 }); // plan→screen similarity transform (fit × zoom/pan/rotate)
   const fit = useRef({ s: 1, ox: 0, oy: 0 });      // base "whole plan fits" transform
-  const view = useRef({ zoom: 1, panx: 0, pany: 0 }); // user zoom (≥1) + pan, applied on top of the fit
+  const view = useRef({ zoom: 1, panx: 0, pany: 0, rot: 0 }); // user zoom (≥1) + pan + free rotation, on top of the fit
   const drag = useRef(null);                       // active interaction
   const gesture = useRef(null);                    // active two-finger pinch/pan
   const [tool, setTool] = useState("move");
@@ -546,8 +581,8 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     else bg.current = null;
   }, [img]);
 
-  // reset zoom/pan when the plan changes
-  useEffect(() => { view.current = { zoom: 1, panx: 0, pany: 0 }; }, [img]);
+  // reset zoom/pan/rotation when the plan changes
+  useEffect(() => { view.current = { zoom: 1, panx: 0, pany: 0, rot: 0 }; }, [img]);
 
   // size canvas to its container
   useEffect(() => {
@@ -559,7 +594,8 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     return () => ro.disconnect();
   }, [img]);
 
-  // compute transform: base fit, then the user's zoom (around canvas center) + pan on top
+  // compute transform: base fit, then the user's zoom + pan (around canvas center), then a free
+  // rotation about that center — a similarity transform screen = R(θ)·s·plan + offset (map-like).
   const recompute = useCallback(() => {
     if (!img) return;
     const pad = 20;
@@ -571,15 +607,24 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     view.current.panx = Math.max(-halfW, Math.min(halfW, view.current.panx));
     view.current.pany = Math.max(-halfH, Math.min(halfH, view.current.pany));
     const cx = size.w / 2, cy = size.h / 2;
-    tf.current = {
-      s: s0 * z,
-      ox: cx + (fit.current.ox - cx) * z + view.current.panx,
-      oy: cy + (fit.current.oy - cy) * z + view.current.pany,
-    };
+    // axis-aligned offset (no rotation) for the fit×zoom×pan stack
+    const ox0 = cx + (fit.current.ox - cx) * z + view.current.panx;
+    const oy0 = cy + (fit.current.oy - cy) * z + view.current.pany;
+    // rotate the whole view about the canvas center by θ
+    const th = view.current.rot || 0, cos = Math.cos(th), sin = Math.sin(th);
+    const ox = cx + cos * (ox0 - cx) - sin * (oy0 - cy);
+    const oy = cy + sin * (ox0 - cx) + cos * (oy0 - cy);
+    tf.current = { s: s0 * z, ox, oy, cos, sin };
   }, [img, size]);
 
-  const toScreen = (x, y) => ({ x: tf.current.ox + x * tf.current.s, y: tf.current.oy + y * tf.current.s });
-  const toPlan = (sx, sy) => ({ x: (sx - tf.current.ox) / tf.current.s, y: (sy - tf.current.oy) / tf.current.s });
+  const toScreen = (x, y) => ({
+    x: tf.current.ox + tf.current.s * (tf.current.cos * x - tf.current.sin * y),
+    y: tf.current.oy + tf.current.s * (tf.current.sin * x + tf.current.cos * y),
+  });
+  const toPlan = (sx, sy) => {
+    const dx = sx - tf.current.ox, dy = sy - tf.current.oy, s = tf.current.s || 1;
+    return { x: (tf.current.cos * dx + tf.current.sin * dy) / s, y: (-tf.current.sin * dx + tf.current.cos * dy) / s };
+  };
 
   // ---- draw ----
   const draw = useCallback(() => {
@@ -593,8 +638,11 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     // backdrop
     x.fillStyle = "rgba(255,255,255,0.02)"; x.fillRect(0, 0, size.w, size.h);
     if (bg.current && showImg) {
+      x.save();
       x.globalAlpha = 0.45;
-      x.drawImage(bg.current, tf.current.ox, tf.current.oy, img.w * tf.current.s, img.h * tf.current.s);
+      x.translate(tf.current.ox, tf.current.oy); x.rotate(view.current.rot || 0);
+      x.drawImage(bg.current, 0, 0, img.w * tf.current.s, img.h * tf.current.s);
+      x.restore();
       x.globalAlpha = 1;
     }
     // blank-canvas reference grid (no photo): one line per scale-unit (1 ft in "Draw a new plan")
@@ -609,7 +657,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     furniture.forEach((f) => {
       const c = toScreen(f.x, f.y);
       const w = f.w * tf.current.s, h = f.h * tf.current.s;
-      x.save(); x.translate(c.x, c.y); x.rotate((f.deg || 0) * Math.PI / 180);
+      x.save(); x.translate(c.x, c.y); x.rotate((f.deg || 0) * Math.PI / 180 + (view.current.rot || 0));
       x.fillStyle = "rgba(94,234,212,0.14)"; x.strokeStyle = "rgba(94,234,212,0.75)"; x.lineWidth = 1.5;
       x.beginPath(); x.rect(-w / 2, -h / 2, w, h); x.fill(); x.stroke();
       x.restore();
@@ -621,7 +669,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     stairs.forEach((s) => {
       const c = toScreen(s.x, s.y);
       const w = s.w * tf.current.s, h = s.h * tf.current.s;
-      x.save(); x.translate(c.x, c.y); x.rotate((s.deg || 0) * Math.PI / 180);
+      x.save(); x.translate(c.x, c.y); x.rotate((s.deg || 0) * Math.PI / 180 + (view.current.rot || 0));
       x.fillStyle = "rgba(251,146,60,0.16)"; x.strokeStyle = "rgba(251,146,60,0.8)"; x.lineWidth = 1.5;
       x.beginPath(); x.rect(-w / 2, -h / 2, w, h); x.fill(); x.stroke();
       const n = Math.max(2, Math.min(12, Math.round(Math.max(w, h) / 12)));
@@ -663,9 +711,12 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     }
     // draft wall
     if (drag.current?.type === "newwall") {
-      const a = toScreen(drag.current.x1, drag.current.y1), b = toScreen(drag.current.x2, drag.current.y2);
+      const dc = drag.current;
+      const a = toScreen(dc.x1, dc.y1), b = toScreen(dc.x2, dc.y2);
       x.strokeStyle = "#7CFFCB"; x.lineWidth = 4; x.setLineDash([6, 5]);
       x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke(); x.setLineDash([]);
+      // ring the end(s) snapped onto an existing corner, so the connection is obvious
+      [[dc.snapStart, a], [dc.snapEnd, b]].forEach(([on, p]) => { if (on) { x.strokeStyle = "#7CFFCB"; x.lineWidth = 2; x.beginPath(); x.arc(p.x, p.y, 9, 0, 7); x.stroke(); } });
     }
     // openings
     openings.forEach((o) => {
@@ -700,7 +751,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       const b = boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
       if (b) {
         const o = b.o, c = toScreen(o.x, o.y), w = o.w * tf.current.s, h = o.h * tf.current.s;
-        x.save(); x.translate(c.x, c.y); x.rotate((o.deg || 0) * Math.PI / 180);
+        x.save(); x.translate(c.x, c.y); x.rotate((o.deg || 0) * Math.PI / 180 + (view.current.rot || 0));
         x.strokeStyle = "#7CFFCB"; x.lineWidth = 2; x.setLineDash([5, 3]);
         x.strokeRect(-w / 2, -h / 2, w, h); x.setLineDash([]); x.restore();
         boxCorners(o).forEach((cn) => { const p = toScreen(cn.x, cn.y); x.fillStyle = "#7CFFCB"; x.strokeStyle = "#0c0a1f"; x.lineWidth = 1.5; x.beginPath(); x.rect(p.x - 5, p.y - 5, 10, 10); x.fill(); x.stroke(); });
@@ -716,8 +767,13 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     v.zoom = z; if (z === 1) { v.panx = 0; v.pany = 0; }
     draw();
   };
-  const fitView = () => { view.current = { zoom: 1, panx: 0, pany: 0 }; draw(); };
-  const onWheel = (e) => { e.preventDefault(); applyZoom(e.deltaY < 0 ? 1.12 : 1 / 1.12); };
+  const fitView = () => { view.current = { zoom: 1, panx: 0, pany: 0, rot: 0 }; draw(); };
+  // wheel zooms; Shift+wheel rotates the view (desktop equivalent of a two-finger twist)
+  const onWheel = (e) => {
+    e.preventDefault();
+    if (e.shiftKey) { view.current.rot = (view.current.rot || 0) + (e.deltaY < 0 ? -1 : 1) * 0.08; draw(); }
+    else applyZoom(e.deltaY < 0 ? 1.12 : 1 / 1.12);
+  };
 
   // delete the selected box with the keyboard (desktop), ignoring text fields
   useEffect(() => {
@@ -747,6 +803,21 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   // snap a coordinate to the foot grid when drawing on the blank "Draw a new plan" canvas
   const snapGrid = (v) => (img?.blank && scale ? Math.round(v / scale.pixelsPerUnit) * scale.pixelsPerUnit : v);
 
+  // snap a draft point to a nearby existing wall endpoint (so corners connect cleanly), else to the
+  // foot grid. Returns { x, y, snapped }. excludeId skips a wall's own ends when dragging that wall.
+  const SNAP_SCREEN_PX = 14;
+  const snapEndpoint = (x, y, excludeId) => {
+    let best = null, bd = SNAP_SCREEN_PX / (tf.current.s || 1);
+    for (const w of walls) {
+      if (w.id === excludeId) continue;
+      for (const e of [[w.x1, w.y1], [w.x2, w.y2]]) {
+        const d = Math.hypot(e[0] - x, e[1] - y);
+        if (d < bd) { bd = d; best = { x: e[0], y: e[1] }; }
+      }
+    }
+    return best ? { ...best, snapped: true } : { x: snapGrid(x), y: snapGrid(y), snapped: false };
+  };
+
   // furniture + stairs as one selectable "box" list (stairs drawn first, so furniture is on top)
   const boxList = () => [...furniture.map((o) => ({ kind: "furn", o })), ...stairs.map((o) => ({ kind: "stair", o }))];
   const setBox = (kind, id, patch) => (kind === "furn"
@@ -758,6 +829,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   // delete whatever is selected (wall / door / window / furniture / stairs)
   const deleteSelected = () => {
     if (!selected) return;
+    onPushHistory?.();
     const { kind, id } = selected;
     if (kind === "wall") setWalls((a) => a.filter((w) => w.id !== id));
     else if (kind === "opening") setOpenings((a) => a.filter((o) => o.id !== id));
@@ -783,7 +855,8 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       gesture.current = {
         dist: Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) || 1,
         mx: (t0.clientX + t1.clientX) / 2, my: (t0.clientY + t1.clientY) / 2,
-        zoom0: view.current.zoom, panx0: view.current.panx, pany0: view.current.pany,
+        ang: Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX),
+        zoom0: view.current.zoom, panx0: view.current.panx, pany0: view.current.pany, rot0: view.current.rot || 0,
       };
       drag.current = null;
       return;
@@ -792,12 +865,13 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     const hitR = 10 / tf.current.s;
 
     if (tool === "scale") { setScaleDraft({ x1: x, y1: y, x2: x, y2: y }); drag.current = { type: "scale" }; return; }
-    if (tool === "wall") { const gx = snapGrid(x), gy = snapGrid(y); drag.current = { type: "newwall", x1: gx, y1: gy, x2: gx, y2: gy }; return; }
+    if (tool === "wall") { const sp = snapEndpoint(x, y); drag.current = { type: "newwall", x1: sp.x, y1: sp.y, x2: sp.x, y2: sp.y, snapStart: sp.snapped, snapEnd: sp.snapped }; return; }
     if (tool === "door" || tool === "window") {
       const nw = nearestWall(x, y);
       if (nw && nw.dist < 40 / tf.current.s) {
         const um = scale ? (scale.unit === "ft" ? FT_TO_M : 1) : 1;
         const defW = scale ? ((tool === "door" ? DOOR_W_M : WIN_W_M) / um) * scale.pixelsPerUnit : 36;
+        onPushHistory?.();
         setOpenings((o) => [...o, { id: nid(), x: nw.cx, y: nw.cy, w: defW, type: tool }]);
       }
       return;
@@ -805,11 +879,11 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     if (tool === "erase") {
       // opening first
       const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 10; });
-      if (oh) { setOpenings((o) => o.filter((q) => q.id !== oh.id)); return; }
+      if (oh) { onPushHistory?.(); setOpenings((o) => o.filter((q) => q.id !== oh.id)); return; }
       const bb = hitBox(x, y, sx, sy); // furniture / stairs
-      if (bb) { delBox(bb.kind, bb.o.id); if (selected?.id === bb.o.id) setSelected(null); return; }
+      if (bb) { onPushHistory?.(); delBox(bb.kind, bb.o.id); if (selected?.id === bb.o.id) setSelected(null); return; }
       const nw = nearestWall(x, y);
-      if (nw && nw.dist < hitR * 1.5) setWalls((w) => w.filter((q) => q.id !== nw.w.id));
+      if (nw && nw.dist < hitR * 1.5) { onPushHistory?.(); setWalls((w) => w.filter((q) => q.id !== nw.w.id)); }
       return;
     }
     // move tool — priority: resize handle of selection → wall endpoint → opening → box body (select+move)
@@ -843,28 +917,33 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   };
 
   const onMove = (e) => {
-    // two-finger pinch-zoom + pan
+    // two-finger pinch-zoom + pan + twist-to-rotate (map-like)
     if (e.touches && e.touches.length >= 2 && gesture.current) {
       const t0 = e.touches[0], t1 = e.touches[1], g = gesture.current;
       const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) || 1;
       const mx = (t0.clientX + t1.clientX) / 2, my = (t0.clientY + t1.clientY) / 2;
+      const ang = Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX);
       view.current.zoom = Math.max(1, Math.min(8, g.zoom0 * (dist / g.dist)));
       view.current.panx = g.panx0 + (mx - g.mx);
       view.current.pany = g.pany0 + (my - g.my);
+      view.current.rot = g.rot0 + (ang - g.ang);
       draw();
       return;
     }
     if (!drag.current) return;
     const { x, y } = getXY(e);
     const d = drag.current;
+    // snapshot once, on the first real move of a geometry-changing drag (not on a plain tap)
+    if (!d.histPushed && ["endpoint", "wallmove", "opening", "boxmove", "boxresize"].includes(d.type)) { onPushHistory?.(); d.histPushed = true; }
     if (d.type === "endpoint") {
-      const gx = snapGrid(x), gy = snapGrid(y);
+      const sp = snapEndpoint(x, y, d.id);   // connect to a nearby corner, else grid-snap
       // editing a wall counts as reviewing it → clear any "uncertain" flag (conf:1)
-      setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: gx, y1: gy, conf: 1 } : { ...w, x2: gx, y2: gy, conf: 1 }) : w));
+      setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: sp.x, y1: sp.y, conf: 1 } : { ...w, x2: sp.x, y2: sp.y, conf: 1 }) : w));
     } else if (d.type === "wallmove") {
       setWalls((ws) => ws.map((w) => w.id === d.id ? { ...w, x1: x + d.gx1, y1: y + d.gy1, x2: x + d.gx2, y2: y + d.gy2, conf: 1 } : w));
     } else if (d.type === "newwall") {
-      drag.current = { ...d, x2: snapGrid(x), y2: snapGrid(y) }; draw();
+      const sp = snapEndpoint(x, y);
+      drag.current = { ...d, x2: sp.x, y2: sp.y, snapEnd: sp.snapped }; draw();
     } else if (d.type === "scale") {
       setScaleDraft((s) => s && { ...s, x2: x, y2: y });
     } else if (d.type === "opening") {
@@ -883,8 +962,10 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   const onUp = () => {
     const d = drag.current;
     if (d?.type === "newwall") {
-      if (Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 6 / tf.current.s)
+      if (Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 6 / tf.current.s) {
+        onPushHistory?.();
         setWalls((w) => [...w, { id: nid(), x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2 }]);
+      }
     }
     if (d?.type === "scale") {
       const len = Math.hypot(scaleDraft.x2 - scaleDraft.x1, scaleDraft.y2 - scaleDraft.y1);
@@ -906,6 +987,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       if (len > 0) { pixelsPerUnit = px / len; unit = scaleInput.unit; }
     }
     if (pixelsPerUnit) {
+      onPushHistory?.();
       setScale({ pixelsPerUnit, unit });
       setScaleDraft(null);
       setScaleInput((s) => ({ len: "", unit, squares: "", ftPerSq: s.ftPerSq }));
@@ -941,14 +1023,19 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
             {label}
           </button>
         ))}
+        <button onClick={() => onUndo?.()} disabled={!canUndo} title="Undo last change (Ctrl/Cmd+Z)"
+          className="px-2.5 py-1.5 rounded-lg text-sm flex items-center gap-1"
+          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", color: canUndo ? "#cbd5e1" : "#64748b", opacity: canUndo ? 1 : 0.5, cursor: canUndo ? "pointer" : "default" }}>
+          ↶ Undo
+        </button>
         <div className="flex-1" />
         <button onClick={() => { setNameDraft(savedName || ""); setSaving(true); }} title="Save this plan to come back to later"
           className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
           💾 Save
         </button>
-        <button onClick={onRotate} title="Rotate the whole plan 90°"
+        <button onClick={() => { onPushHistory?.(); onRotate(); }} title="Rotate the whole plan 90° (drag with two fingers to free-rotate the view)"
           className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
-          ↻ Rotate
+          ↻ Rotate 90°
         </button>
         <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
           <input type="checkbox" checked={tidy} onChange={(e) => setTidy?.(e.target.checked)} /> tidy up the drawing
@@ -1006,20 +1093,20 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
             <span style={{ color: "#7CFFCB" }}>{label} selected</span>
             {sel.kind === "furn" && (
               <label className="flex items-center gap-1.5 text-slate-300">this is a
-                <select value={sel.o.type} onChange={(e) => setBox("furn", sel.o.id, { type: e.target.value })}
+                <select value={sel.o.type} onChange={(e) => { onPushHistory?.(); setBox("furn", sel.o.id, { type: e.target.value }); }}
                   className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
                   {FURN_TYPE_LIST.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}
                 </select>
               </label>
             )}
             {sel.kind === "opening" && (
-              <button onClick={() => setOpenings((o) => o.map((q) => q.id === sel.o.id ? { ...q, type: q.type === "door" ? "window" : "door" } : q))}
+              <button onClick={() => { onPushHistory?.(); setOpenings((o) => o.map((q) => q.id === sel.o.id ? { ...q, type: q.type === "door" ? "window" : "door" } : q)); }}
                 className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)" }}>
                 make it a {sel.o.type === "door" ? "window" : "door"}
               </button>
             )}
             {wallUnsure && (
-              <button onClick={() => setWalls((a) => a.map((w) => w.id === sel.o.id ? { ...w, conf: 1 } : w))}
+              <button onClick={() => { onPushHistory?.(); setWalls((a) => a.map((w) => w.id === sel.o.id ? { ...w, conf: 1 } : w)); }}
                 className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.18)", border: "1px solid rgba(124,255,203,0.45)" }}>
                 looks right ✓
               </button>
@@ -1121,7 +1208,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           Build & walk it →
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-2">Tip: tap any piece to select it, then drag to move it. Drag a wall's ends to reshape it. Doors are openings you can walk through.</p>
+      <p className="text-xs text-slate-500 mt-2">Tip: when adding or reshaping a wall, its end snaps onto a nearby corner (a ring shows the join). Pinch to zoom, twist two fingers to spin the view, and use ↶ Undo (or Ctrl/Cmd+Z) to take back the last change.</p>
     </div>
   );
 }
