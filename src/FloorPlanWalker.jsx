@@ -123,6 +123,8 @@ export default function FloorPlanWalker() {
   const [ceiling, setCeiling] = useState(CEILING_FT_DEFAULT); // stored in feet; converted to meters in the 3D walk
   const [tidy, setTidy] = useState(true);        // "Tidy up the drawing": square the trace for display + build
   const [error, setError] = useState(null);
+  const [showIntro, setShowIntro] = useState(() => { try { return !localStorage.getItem("bw_intro_seen"); } catch { return false; } });
+  const closeIntro = () => { try { localStorage.setItem("bw_intro_seen", "1"); } catch {} setShowIntro(false); };
 
   // squared walls used for the 3D build and the editor's "after" preview; raw walls stay editable
   const tidied = useMemo(() => (tidy ? tidyWalls(walls) : walls), [tidy, walls]);
@@ -183,7 +185,7 @@ export default function FloorPlanWalker() {
       }
       setStage("editor");
     } catch (err) {
-      setError("Couldn't read the plan automatically. Open the editor and trace the walls by hand — every tool still works.");
+      setError("That photo was a little hard to read — try again in good light, or just draw the walls yourself with the tools below.");
       setStage("editor");
     }
   }, [img]);
@@ -227,6 +229,32 @@ export default function FloorPlanWalker() {
     setStage("editor");
   }, []);
 
+  // rotate the whole plan 90° clockwise — photo + every traced piece together, so they stay aligned
+  const rotatePlan = useCallback(() => {
+    if (!img) return;
+    const oldH = img.h;
+    const rot = (x, y) => [oldH - y, x]; // 90° CW; new plan size is (oldH × oldW)
+    const apply = (url) => {
+      setImg({ url, w: img.h, h: img.w, blank: img.blank });
+      setWalls((a) => a.map((w) => { const [x1, y1] = rot(w.x1, w.y1), [x2, y2] = rot(w.x2, w.y2); return { ...w, x1, y1, x2, y2 }; }));
+      setOpenings((a) => a.map((q) => { const [x, y] = rot(q.x, q.y); return { ...q, x, y }; }));
+      setFurniture((a) => a.map((q) => { const [x, y] = rot(q.x, q.y); return { ...q, x, y, deg: ((q.deg || 0) + 90) % 360 }; }));
+      setStairs((a) => a.map((q) => { const [x, y] = rot(q.x, q.y); return { ...q, x, y, deg: ((q.deg || 0) + 90) % 360 }; }));
+      setRooms((a) => a.map((q) => { const [x, y] = rot(q.x, q.y); return { ...q, x, y }; }));
+    };
+    if (img.url) {
+      const im = new Image();
+      im.onload = () => {
+        const c = document.createElement("canvas");
+        c.width = img.h; c.height = img.w;            // swapped dimensions
+        const ctx = c.getContext("2d");
+        ctx.translate(c.width, 0); ctx.rotate(Math.PI / 2); ctx.drawImage(im, 0, 0);
+        apply(c.toDataURL("image/jpeg", 0.9));
+      };
+      im.src = img.url;
+    } else apply(null); // blank/sample: rotate coords only
+  }, [img]);
+
   // start from a blank 1-ft grid (no photo) — everything she draws is already to scale
   const startBlank = useCallback(() => {
     const PXFT = 24; // pixels per foot of the blank canvas (1 grid square)
@@ -241,7 +269,8 @@ export default function FloorPlanWalker() {
       className="w-full min-h-screen text-slate-100"
     >
       <div className="min-h-screen w-full" style={{ background: "radial-gradient(1200px 600px at 70% -10%, #2a1f5e 0%, #15122e 45%, #0c0a1f 100%)" }}>
-        <Header stage={stage} />
+        {showIntro && <Welcome onClose={closeIntro} />}
+        <Header stage={stage} onHelp={() => setShowIntro(true)} />
         {stage === "upload" && (
           <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank} onReset={() => setImg(null)} />
         )}
@@ -255,7 +284,7 @@ export default function FloorPlanWalker() {
             rooms={rooms} setRooms={setRooms}
             scale={scale} setScale={setScale}
             ceiling={ceiling} setCeiling={setCeiling}
-            error={error}
+            error={error} onRotate={rotatePlan}
             onWalk={() => setStage("walk")}
             onBack={() => { setStage("upload"); }}
           />
@@ -268,16 +297,46 @@ export default function FloorPlanWalker() {
   );
 }
 
+// ---------- first-open tutorial ----------
+function Welcome({ onClose }) {
+  const steps = [
+    ["📷", "Add your plan", "Snap a photo of a floor plan — a sketch on paper is perfect — or start a blank grid and draw one."],
+    ["✨", "We trace it", "We find the walls, doors, windows, and furniture for you."],
+    ["✏️", "Fix it up", "Tap any piece to move, resize, or delete it. Pinch to zoom in for the small stuff."],
+    ["🚶", "Walk it", "Step inside and walk around your space in 3D."],
+  ];
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-5" style={{ background: "rgba(8,6,20,0.72)" }} onClick={onClose}>
+      <div className="w-full max-w-md rounded-2xl p-6" style={{ background: "#15122e", border: "1px solid rgba(255,255,255,0.12)" }} onClick={(e) => e.stopPropagation()}>
+        <h2 className="text-xl font-semibold mb-1" style={{ color: "#c7b6ff" }}>Welcome 👋</h2>
+        <p className="text-slate-400 text-sm mb-5">Turn a floor plan into a space you can walk through — in four steps:</p>
+        <div className="flex flex-col gap-3.5 mb-6">
+          {steps.map(([icon, title, body], i) => (
+            <div key={i} className="flex gap-3">
+              <div className="text-xl leading-none mt-0.5">{icon}</div>
+              <div>
+                <div className="text-slate-100 font-medium text-sm">{i + 1}. {title}</div>
+                <div className="text-slate-400 text-xs leading-relaxed">{body}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        <button onClick={onClose} className="w-full py-2.5 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Get started</button>
+      </div>
+    </div>
+  );
+}
+
 // ---------- header ----------
-function Header({ stage }) {
-  const steps = [["upload", "Capture"], ["analyzing", "Read"], ["editor", "Correct & scale"], ["walk", "Walk it"]];
+function Header({ stage, onHelp }) {
+  const steps = [["upload", "Add plan"], ["analyzing", "Reading"], ["editor", "Fix it up"], ["walk", "Walk it"]];
   const idx = { upload: 0, analyzing: 1, editor: 2, walk: 3 }[stage];
   return (
     <div className="flex items-center justify-between px-5 py-3 border-b border-white/10 backdrop-blur"
       style={{ background: "rgba(255,255,255,0.03)" }}>
       <div className="flex items-baseline gap-3">
         <span className="text-base font-semibold tracking-tight" style={{ color: "#c7b6ff" }}>Blueprint Walker</span>
-        <span className="text-xs text-slate-400 hidden sm:inline">hand-drawn plan → walkable, to-scale space</span>
+        <span className="text-xs text-slate-400 hidden sm:inline">your floor plan, as a space you can walk through</span>
       </div>
       <div className="flex items-center gap-2">
         {steps.map(([k, label], i) => (
@@ -289,6 +348,9 @@ function Header({ stage }) {
             {i < steps.length - 1 && <span className="text-slate-600 text-xs">→</span>}
           </div>
         ))}
+        <button onClick={onHelp} title="How it works" aria-label="How it works"
+          className="ml-1 w-7 h-7 rounded-full text-sm text-slate-200 flex items-center justify-center shrink-0"
+          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.15)" }}>?</button>
       </div>
     </div>
   );
@@ -305,7 +367,7 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset }) {
       {!img ? (
         <>
           <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight mb-2">Turn a drawing into a space you can walk through.</h1>
-          <p className="text-slate-400 mb-7 text-sm">Upload or photograph a floor plan — hand-drawn is fine. Claude reads the walls, you correct anything it got wrong, set the real scale, then step inside.</p>
+          <p className="text-slate-400 mb-7 text-sm">Take a photo of a floor plan — even a rough sketch on paper. We'll trace the walls for you, you fix anything that looks off, tell us the real size, then walk through your space.</p>
           <div
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
             onDragLeave={() => setDrag(false)}
@@ -327,12 +389,12 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset }) {
         </>
       ) : (
         <div className="text-center">
-          <h2 className="text-lg font-medium mb-4">Ready to read this plan.</h2>
+          <h2 className="text-lg font-medium mb-4">Looks good — ready when you are.</h2>
           <div className="inline-block rounded-xl overflow-hidden mb-5" style={{ border: "1px solid rgba(255,255,255,0.12)", maxWidth: "100%" }}>
             {img.url ? <img src={img.url} alt="floor plan" style={{ maxHeight: 420, display: "block" }} /> : <div className="px-16 py-12 text-slate-400">sample plan loaded</div>}
           </div>
           <div className="flex gap-3 justify-center">
-            <button onClick={onAnalyze} className="px-5 py-2.5 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Read the walls →</button>
+            <button onClick={onAnalyze} className="px-5 py-2.5 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Trace my plan →</button>
             <button onClick={onReset} className="px-4 py-2.5 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Use a different image</button>
           </div>
         </div>
@@ -345,18 +407,21 @@ function Analyzing() {
   return (
     <div className="max-w-xl mx-auto px-5 py-24 text-center">
       <div className="inline-block w-10 h-10 rounded-full mb-5 animate-spin" style={{ border: "3px solid rgba(124,99,255,0.25)", borderTopColor: "#a48bff" }} />
-      <p className="text-slate-300">Reading the drawing — tracing walls, doors, and windows…</p>
-      <p className="text-slate-500 text-xs mt-2">Vision models propose; you'll get to correct everything next.</p>
+      <p className="text-slate-300">Reading your plan…</p>
+      <p className="text-slate-500 text-xs mt-2">Finding the walls, doors, and windows — you'll get to fix anything next.</p>
     </div>
   );
 }
 
 // ================= 2D EDITOR =================
-function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onWalk, onBack }) {
+function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRotate, onWalk, onBack }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
-  const tf = useRef({ s: 1, ox: 0, oy: 0 });      // plan→screen transform
+  const tf = useRef({ s: 1, ox: 0, oy: 0 });      // plan→screen transform (fit × user zoom/pan)
+  const fit = useRef({ s: 1, ox: 0, oy: 0 });      // base "whole plan fits" transform
+  const view = useRef({ zoom: 1, panx: 0, pany: 0 }); // user zoom (≥1) + pan, applied on top of the fit
   const drag = useRef(null);                       // active interaction
+  const gesture = useRef(null);                    // active two-finger pinch/pan
   const [tool, setTool] = useState("move");
   const [showImg, setShowImg] = useState(true);
   const [selected, setSelected] = useState(null); // { kind:'furn'|'stair', id } currently-selected box
@@ -372,6 +437,9 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     else bg.current = null;
   }, [img]);
 
+  // reset zoom/pan when the plan changes
+  useEffect(() => { view.current = { zoom: 1, panx: 0, pany: 0 }; }, [img]);
+
   // size canvas to its container
   useEffect(() => {
     const ro = new ResizeObserver(() => {
@@ -382,12 +450,23 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     return () => ro.disconnect();
   }, [img]);
 
-  // compute transform (fit plan into canvas)
+  // compute transform: base fit, then the user's zoom (around canvas center) + pan on top
   const recompute = useCallback(() => {
     if (!img) return;
     const pad = 20;
-    const s = Math.min((size.w - pad * 2) / img.w, (size.h - pad * 2) / img.h);
-    tf.current = { s, ox: (size.w - img.w * s) / 2, oy: (size.h - img.h * s) / 2 };
+    const s0 = Math.min((size.w - pad * 2) / img.w, (size.h - pad * 2) / img.h);
+    fit.current = { s: s0, ox: (size.w - img.w * s0) / 2, oy: (size.h - img.h * s0) / 2 };
+    const z = view.current.zoom;
+    // keep part of the plan on screen
+    const halfW = (img.w * s0 * z) / 2 + size.w / 2, halfH = (img.h * s0 * z) / 2 + size.h / 2;
+    view.current.panx = Math.max(-halfW, Math.min(halfW, view.current.panx));
+    view.current.pany = Math.max(-halfH, Math.min(halfH, view.current.pany));
+    const cx = size.w / 2, cy = size.h / 2;
+    tf.current = {
+      s: s0 * z,
+      ox: cx + (fit.current.ox - cx) * z + view.current.panx,
+      oy: cy + (fit.current.oy - cy) * z + view.current.pany,
+    };
   }, [img, size]);
 
   const toScreen = (x, y) => ({ x: tf.current.ox + x * tf.current.s, y: tf.current.oy + y * tf.current.s });
@@ -448,18 +527,22 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     // result bold on top, so "before vs after" is visible; otherwise the raw walls are the bold layer.
     x.lineCap = "round";
     const overlay = tidy && tidied.length > 0;
+    const selWallId = selected?.kind === "wall" ? selected.id : null;
+    const selOpenId = selected?.kind === "opening" ? selected.id : null;
     walls.forEach((w) => {
       const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2);
-      x.strokeStyle = overlay ? "rgba(199,182,255,0.28)" : "#c7b6ff";
-      x.lineWidth = overlay ? 2 : 5;
+      const isSel = w.id === selWallId;
+      x.strokeStyle = (!overlay && isSel) ? "#7CFFCB" : (overlay ? "rgba(199,182,255,0.28)" : "#c7b6ff");
+      x.lineWidth = (!overlay && isSel) ? 6 : (overlay ? 2 : 5);
       x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
-      [a, b].forEach((p) => { x.fillStyle = "#1b1640"; x.strokeStyle = "#a48bff"; x.lineWidth = 2;
-        x.beginPath(); x.rect(p.x - 4, p.y - 4, 8, 8); x.fill(); x.stroke(); });
+      [a, b].forEach((p) => { x.fillStyle = isSel ? "#7CFFCB" : "#1b1640"; x.strokeStyle = isSel ? "#0c0a1f" : "#a48bff"; x.lineWidth = 2;
+        x.beginPath(); x.rect(p.x - (isSel ? 5 : 4), p.y - (isSel ? 5 : 4), isSel ? 10 : 8, isSel ? 10 : 8); x.fill(); x.stroke(); });
     });
     if (overlay) {
       tidied.forEach((w) => {
         const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2);
-        x.strokeStyle = "#c7b6ff"; x.lineWidth = 5;
+        const isSel = w.id === selWallId;
+        x.strokeStyle = isSel ? "#7CFFCB" : "#c7b6ff"; x.lineWidth = isSel ? 6 : 5;
         x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
       });
     }
@@ -472,8 +555,10 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     // openings
     openings.forEach((o) => {
       const p = toScreen(o.x, o.y);
+      const isSel = o.id === selOpenId;
+      if (isSel) { x.strokeStyle = "#7CFFCB"; x.lineWidth = 2.5; x.beginPath(); x.arc(p.x, p.y, 11, 0, 7); x.stroke(); }
       x.fillStyle = o.type === "door" ? "#34d399" : "#38bdf8";
-      x.beginPath(); x.arc(p.x, p.y, 6, 0, Math.PI * 2); x.fill();
+      x.beginPath(); x.arc(p.x, p.y, isSel ? 7 : 6, 0, Math.PI * 2); x.fill();
       x.strokeStyle = "rgba(0,0,0,0.4)"; x.lineWidth = 1.5; x.stroke();
     });
     // room name labels (on top), with a soft pill behind for legibility
@@ -510,12 +595,21 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
 
   useEffect(() => { draw(); }, [draw]);
 
+  // ---- zoom / pan ----
+  const applyZoom = (factor) => {
+    const v = view.current, z = Math.max(1, Math.min(8, v.zoom * factor));
+    v.zoom = z; if (z === 1) { v.panx = 0; v.pany = 0; }
+    draw();
+  };
+  const fitView = () => { view.current = { zoom: 1, panx: 0, pany: 0 }; draw(); };
+  const onWheel = (e) => { e.preventDefault(); applyZoom(e.deltaY < 0 ? 1.12 : 1 / 1.12); };
+
   // delete the selected box with the keyboard (desktop), ignoring text fields
   useEffect(() => {
     const onKey = (e) => {
       if (!selected) return;
       if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
-      if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); delBox(selected.kind, selected.id); setSelected(null); }
+      if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); deleteSelected(); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -546,6 +640,15 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   const delBox = (kind, id) => (kind === "furn"
     ? setFurniture((a) => a.filter((o) => o.id !== id))
     : setStairs((a) => a.filter((o) => o.id !== id)));
+  // delete whatever is selected (wall / door / window / furniture / stairs)
+  const deleteSelected = () => {
+    if (!selected) return;
+    const { kind, id } = selected;
+    if (kind === "wall") setWalls((a) => a.filter((w) => w.id !== id));
+    else if (kind === "opening") setOpenings((a) => a.filter((o) => o.id !== id));
+    else delBox(kind, id);
+    setSelected(null);
+  };
   // hit-test boxes: a resize handle of the selected box wins, else the topmost body under the point
   const hitBox = (px, py, sx, sy) => {
     const list = boxList();
@@ -559,6 +662,17 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
 
   const onDown = (e) => {
     e.preventDefault();
+    // two fingers → pinch-zoom + pan, not an edit
+    if (e.touches && e.touches.length >= 2) {
+      const t0 = e.touches[0], t1 = e.touches[1];
+      gesture.current = {
+        dist: Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) || 1,
+        mx: (t0.clientX + t1.clientX) / 2, my: (t0.clientY + t1.clientY) / 2,
+        zoom0: view.current.zoom, panx0: view.current.panx, pany0: view.current.pany,
+      };
+      drag.current = null;
+      return;
+    }
     const { sx, sy, x, y } = getXY(e);
     const hitR = 10 / tf.current.s;
 
@@ -596,21 +710,43 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       for (const end of [1, 2]) {
         const ex = end === 1 ? w.x1 : w.x2, ey = end === 1 ? w.y1 : w.y2;
         const p = toScreen(ex, ey);
-        if (Math.hypot(p.x - sx, p.y - sy) < 9) { drag.current = { type: "endpoint", id: w.id, end }; return; }
+        if (Math.hypot(p.x - sx, p.y - sy) < 9) { setSelected({ kind: "wall", id: w.id }); drag.current = { type: "endpoint", id: w.id, end }; return; }
       }
     }
     const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 9; });
-    if (oh) { drag.current = { type: "opening", id: oh.id }; return; }
+    if (oh) { setSelected({ kind: "opening", id: oh.id }); drag.current = { type: "opening", id: oh.id }; return; }
     if (bh) { setSelected({ kind: bh.kind, id: bh.o.id }); drag.current = { type: "boxmove", kind: bh.kind, id: bh.o.id, gx: bh.o.x - x, gy: bh.o.y - y }; return; }
+    // tap on a wall line (away from its ends): select it and drag the whole wall
+    const nw = nearestWall(x, y);
+    if (nw && nw.dist < 12 / tf.current.s) {
+      const w = nw.w;
+      setSelected({ kind: "wall", id: w.id });
+      drag.current = { type: "wallmove", id: w.id, gx1: w.x1 - x, gy1: w.y1 - y, gx2: w.x2 - x, gy2: w.y2 - y };
+      return;
+    }
     setSelected(null);
   };
 
   const onMove = (e) => {
+    // two-finger pinch-zoom + pan
+    if (e.touches && e.touches.length >= 2 && gesture.current) {
+      const t0 = e.touches[0], t1 = e.touches[1], g = gesture.current;
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) || 1;
+      const mx = (t0.clientX + t1.clientX) / 2, my = (t0.clientY + t1.clientY) / 2;
+      view.current.zoom = Math.max(1, Math.min(8, g.zoom0 * (dist / g.dist)));
+      view.current.panx = g.panx0 + (mx - g.mx);
+      view.current.pany = g.pany0 + (my - g.my);
+      draw();
+      return;
+    }
     if (!drag.current) return;
     const { x, y } = getXY(e);
     const d = drag.current;
     if (d.type === "endpoint") {
-      setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: x, y1: y } : { ...w, x2: x, y2: y }) : w));
+      const gx = snapGrid(x), gy = snapGrid(y);
+      setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: gx, y1: gy } : { ...w, x2: gx, y2: gy }) : w));
+    } else if (d.type === "wallmove") {
+      setWalls((ws) => ws.map((w) => w.id === d.id ? { ...w, x1: x + d.gx1, y1: y + d.gy1, x2: x + d.gx2, y2: y + d.gy2 } : w));
     } else if (d.type === "newwall") {
       drag.current = { ...d, x2: snapGrid(x), y2: snapGrid(y) }; draw();
     } else if (d.type === "scale") {
@@ -639,6 +775,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       if (len > 8) setScaleInput((s) => ({ ...s, _px: len }));
     }
     drag.current = null;
+    gesture.current = null;
   };
 
   const applyScale = () => {
@@ -687,6 +824,10 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           </button>
         ))}
         <div className="flex-1" />
+        <button onClick={onRotate} title="Rotate the whole plan 90°"
+          className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
+          ↻ Rotate
+        </button>
         <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
           <input type="checkbox" checked={tidy} onChange={(e) => setTidy?.(e.target.checked)} /> tidy up the drawing
         </label>
@@ -695,22 +836,39 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         </label>
       </div>
 
-      <div ref={wrapRef} className="rounded-xl overflow-hidden" style={{ border: "1px solid rgba(255,255,255,0.12)", touchAction: "none" }}>
+      <div ref={wrapRef} className="rounded-xl overflow-hidden relative" style={{ border: "1px solid rgba(255,255,255,0.12)", touchAction: "none" }}>
         <canvas ref={canvasRef}
           onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
           onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
+          onWheel={onWheel}
           style={{ display: "block", cursor: tool === "move" ? "grab" : "crosshair" }} />
+        {/* zoom controls (pinch to zoom + two-finger drag to pan also work) */}
+        <div className="absolute bottom-3 right-3 flex flex-col gap-1.5 select-none">
+          {[["+", () => applyZoom(1.3)], ["⤢", fitView], ["−", () => applyZoom(1 / 1.3)]].map(([label, fn], i) => (
+            <button key={i} onClick={fn} title={label === "⤢" ? "Fit to screen" : label === "+" ? "Zoom in" : "Zoom out"}
+              className="w-9 h-9 rounded-lg text-lg font-medium text-white flex items-center justify-center"
+              style={{ background: "rgba(20,16,46,0.85)", border: "1px solid rgba(255,255,255,0.18)" }}>{label}</button>
+          ))}
+        </div>
       </div>
 
-      {/* selected-furniture control bar */}
+      {/* control bar for whatever is selected — wall / door / window / furniture / stairs */}
       {(() => {
-        const sel = selected && boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
+        if (!selected) return null;
+        let sel = null;
+        if (selected.kind === "wall") { const o = walls.find((w) => w.id === selected.id); sel = o && { kind: "wall", o }; }
+        else if (selected.kind === "opening") { const o = openings.find((p) => p.id === selected.id); sel = o && { kind: "opening", o }; }
+        else sel = boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
         if (!sel) return null;
-        const isFurn = sel.kind === "furn";
+        const label = sel.kind === "furn" ? "Furniture" : sel.kind === "stair" ? "Staircase"
+          : sel.kind === "wall" ? "Wall" : (sel.o.type === "door" ? "Door" : "Window");
+        const hint = sel.kind === "wall" ? "drag the wall to move it · drag an end to reshape"
+          : sel.kind === "opening" ? "drag it along a wall to move it"
+          : "drag the box to move · drag a corner to resize";
         return (
           <div className="mt-3 rounded-lg px-3 py-2.5 flex flex-wrap items-center gap-3 text-sm" style={{ background: "rgba(124,255,203,0.08)", border: "1px solid rgba(124,255,203,0.3)" }}>
-            <span style={{ color: "#7CFFCB" }}>{isFurn ? "Furniture" : "Staircase"} selected</span>
-            {isFurn && (
+            <span style={{ color: "#7CFFCB" }}>{label} selected</span>
+            {sel.kind === "furn" && (
               <label className="flex items-center gap-1.5 text-slate-300">this is a
                 <select value={sel.o.type} onChange={(e) => setBox("furn", sel.o.id, { type: e.target.value })}
                   className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
@@ -718,8 +876,14 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
                 </select>
               </label>
             )}
-            <span className="text-slate-400 text-xs">drag the box to move · drag a corner to resize</span>
-            <button onClick={() => { delBox(sel.kind, sel.o.id); setSelected(null); }}
+            {sel.kind === "opening" && (
+              <button onClick={() => setOpenings((o) => o.map((q) => q.id === sel.o.id ? { ...q, type: q.type === "door" ? "window" : "door" } : q))}
+                className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)" }}>
+                make it a {sel.o.type === "door" ? "window" : "door"}
+              </button>
+            )}
+            <span className="text-slate-400 text-xs">{hint}</span>
+            <button onClick={deleteSelected}
               className="ml-auto px-3 py-1 rounded text-white text-xs font-medium" style={{ background: "#b4444e" }}>Delete</button>
           </div>
         );
@@ -771,14 +935,32 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         </div>
       )}
 
-      {/* status bar */}
-      <div className="mt-4 flex flex-wrap items-center gap-4 text-sm">
-        <span className="text-slate-400">{walls.length} walls · {openings.filter(o => o.type === "door").length} doors · {openings.filter(o => o.type === "window").length} windows · {furniture.length} furniture{stairs.length ? ` · ${stairs.length} stairs` : ""}</span>
-        <span className="text-slate-400">·</span>
+      {/* status bar with a color legend so the dots/colors are self-explanatory */}
+      <div className="mt-4 flex flex-wrap items-center gap-3 text-sm">
+        <div className="flex flex-wrap items-center gap-3 rounded-lg px-3 py-2" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.1)" }}>
+          {[
+            { label: "walls", n: walls.length, color: "#c7b6ff", shape: "line" },
+            { label: "doors", n: openings.filter((o) => o.type === "door").length, color: "#34d399", shape: "dot" },
+            { label: "windows", n: openings.filter((o) => o.type === "window").length, color: "#38bdf8", shape: "dot" },
+            { label: "furniture", n: furniture.length, color: "#5eead4", shape: "box" },
+            ...(stairs.length ? [{ label: "stairs", n: stairs.length, color: "#fb923c", shape: "box" }] : []),
+          ].map((it) => (
+            <span key={it.label} className="flex items-center gap-1.5 text-slate-300">
+              <span style={{
+                display: "inline-block",
+                width: it.shape === "line" ? 14 : 11, height: it.shape === "line" ? 4 : 11,
+                borderRadius: it.shape === "dot" ? "50%" : it.shape === "line" ? 2 : 3,
+                background: it.shape === "box" ? it.color + "44" : it.color,
+                border: it.shape === "box" ? `1px solid ${it.color}` : "none",
+              }} />
+              <span><b className="text-white">{it.n}</b> {it.label}</span>
+            </span>
+          ))}
+        </div>
         {scale ? (
-          <span style={{ color: "#7CFFCB" }}>Scale set{dims ? ` · footprint ≈ ${dims}` : ""}</span>
+          <span style={{ color: "#7CFFCB" }}>Real size set{dims ? ` · about ${dims}` : ""}</span>
         ) : (
-          <span style={{ color: "#fbbf24" }}>No scale yet — set one for true proportions (otherwise an estimate is used)</span>
+          <span style={{ color: "#fbbf24" }}>Tap “Set scale” to tell us the real size (otherwise it's a guess)</span>
         )}
         <label className="text-slate-400 flex items-center gap-2 ml-auto">ceiling
           <input type="range" min="7" max="11" step="0.5" value={ceiling} onChange={(e) => setCeiling(parseFloat(e.target.value))} />
@@ -794,7 +976,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           Build & walk it →
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-2">Tip: drag wall endpoints to fix the trace, drop doors/windows onto walls, then “Set scale”. Doors become openings you can walk through.</p>
+      <p className="text-xs text-slate-500 mt-2">Tip: tap any piece to select it, then drag to move it. Drag a wall's ends to reshape it. Doors are openings you can walk through.</p>
     </div>
   );
 }
@@ -1104,9 +1286,10 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
       <canvas ref={miniRef} className="absolute top-3 right-3 rounded-lg" style={{ width: 150, height: 150, border: "1px solid rgba(255,255,255,0.15)" }} />
       {/* enter overlay */}
       {!locked && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <div className="px-4 py-2 rounded-lg text-sm text-slate-200" style={{ background: "rgba(20,16,46,0.7)", border: "1px solid rgba(255,255,255,0.15)" }}>
-            Click to look around · <b>W A S D</b> move · <b>Shift</b> run · <b>Esc</b> release
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-6">
+          <div className="px-4 py-2.5 rounded-lg text-sm text-slate-200 text-center" style={{ background: "rgba(20,16,46,0.7)", border: "1px solid rgba(255,255,255,0.15)" }}>
+            <span className="sm:hidden">Use the joystick to walk · drag anywhere to look around</span>
+            <span className="hidden sm:inline">Click to look around · <b>W A S D</b> move · <b>Shift</b> run · <b>Esc</b> release</span>
           </div>
         </div>
       )}
