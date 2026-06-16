@@ -1218,7 +1218,18 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
   const mountRef = useRef(null);
   const miniRef = useRef(null);
   const [locked, setLocked] = useState(false);
-  const touchMove = useRef({ x: 0, y: 0 });
+  const touchMove = useRef({ x: 0, y: 0 }); // left stick → move (read in tick)
+  const lookMove = useRef({ x: 0, y: 0 });  // right stick → look (read in tick)
+
+  // Lock the page while walking: on mobile a look-drag would otherwise scroll/rubber-band the
+  // whole page, sliding the fixed joystick out from under your thumb.
+  useEffect(() => {
+    const { body } = document, html = document.documentElement;
+    const prevOverflow = body.style.overflow, prevOverscroll = html.style.overscrollBehavior;
+    body.style.overflow = "hidden";
+    html.style.overscrollBehavior = "none";
+    return () => { body.style.overflow = prevOverflow; html.style.overscrollBehavior = prevOverscroll; };
+  }, []);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -1407,28 +1418,7 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
     const onLockChange = () => setLocked(document.pointerLockElement === renderer.domElement);
     document.addEventListener("pointerlockchange", onLockChange);
 
-    // touch look (right half of screen)
-    let lookId = null, lastLX = 0, lastLY = 0;
-    const tStart = (e) => {
-      for (const t of e.changedTouches) {
-        if (t.clientX - mount.getBoundingClientRect().left > mount.clientWidth * 0.4 && lookId === null) {
-          lookId = t.identifier; lastLX = t.clientX; lastLY = t.clientY;
-        }
-      }
-    };
-    const tMove = (e) => {
-      for (const t of e.changedTouches) {
-        if (t.identifier === lookId) {
-          yaw -= (t.clientX - lastLX) * 0.005; pitch -= (t.clientY - lastLY) * 0.005;
-          pitch = Math.max(-1.45, Math.min(1.45, pitch)); lastLX = t.clientX; lastLY = t.clientY;
-          camera.rotation.set(pitch, yaw, 0, "YXZ");
-        }
-      }
-    };
-    const tEnd = (e) => { for (const t of e.changedTouches) if (t.identifier === lookId) lookId = null; };
-    renderer.domElement.addEventListener("touchstart", tStart, { passive: true });
-    renderer.domElement.addEventListener("touchmove", tMove, { passive: true });
-    renderer.domElement.addEventListener("touchend", tEnd);
+    // Touch look is driven by the right joystick (lookMove ref), applied per-frame in tick().
 
     // ---- minimap ----
     const mini = miniRef.current;
@@ -1474,6 +1464,13 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
         camera.position.x = nx; camera.position.z = nz;
       }
       camera.position.y = EYE_M;
+      // right joystick → look: stick deflection sets the turn rate (like a console controller)
+      const lk = lookMove.current;
+      if (lk.x || lk.y) {
+        yaw -= lk.x * 2.6 * dt;
+        pitch = Math.max(-1.45, Math.min(1.45, pitch - lk.y * 1.9 * dt));
+        camera.rotation.set(pitch, yaw, 0, "YXZ");
+      }
       minimap();
       renderer.render(scene, camera);
     }
@@ -1498,19 +1495,27 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
     };
   }, [walls, openings, furniture, stairs, rooms, scale, ceiling]);
 
-  // ---- touch joystick (left) ----
-  const jBase = useRef(null);
-  const onJoy = (e) => {
-    const t = e.touches[0]; const r = jBase.current.getBoundingClientRect();
+  // ---- twin touch joysticks: left = move, right = look ----
+  // One handler drives both. targetTouches scopes to the finger that landed on *this* stick,
+  // so the two sticks work independently with two thumbs. The nub follows the thumb for feel.
+  const moveBase = useRef(null), moveNub = useRef(null);
+  const lookBase = useRef(null), lookNub = useRef(null);
+  const NUB_TRAVEL = 36; // px the nub can slide from center
+  const drive = (base, nub, out) => (e) => {
+    const t = e.targetTouches[0];
+    if (!t) { out.current = { x: 0, y: 0 }; if (nub.current) nub.current.style.transform = "translate(-50%,-50%)"; return; }
+    const r = base.current.getBoundingClientRect();
     let dx = (t.clientX - (r.left + r.width / 2)) / (r.width / 2);
     let dy = (t.clientY - (r.top + r.height / 2)) / (r.height / 2);
     const m = Math.hypot(dx, dy); if (m > 1) { dx /= m; dy /= m; }
-    touchMove.current = { x: dx, y: dy };
+    out.current = { x: dx, y: dy };
+    if (nub.current) nub.current.style.transform = `translate(calc(-50% + ${dx * NUB_TRAVEL}px), calc(-50% + ${dy * NUB_TRAVEL}px))`;
   };
-  const endJoy = () => (touchMove.current = { x: 0, y: 0 });
+  const onMoveStick = drive(moveBase, moveNub, touchMove);
+  const onLookStick = drive(lookBase, lookNub, lookMove);
 
   return (
-    <div className="relative" style={{ height: "calc(100vh - 53px)" }}>
+    <div className="relative" style={{ height: "calc(100dvh - 53px)", touchAction: "none", overscrollBehavior: "none" }}>
       <div ref={mountRef} className="absolute inset-0" />
       {/* crosshair */}
       <div className="absolute left-1/2 top-1/2 pointer-events-none" style={{ transform: "translate(-50%,-50%)", width: 6, height: 6, borderRadius: 3, background: "rgba(255,255,255,0.7)" }} />
@@ -1520,7 +1525,7 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
       {!locked && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-6">
           <div className="px-4 py-2.5 rounded-lg text-sm text-slate-200 text-center" style={{ background: "rgba(20,16,46,0.7)", border: "1px solid rgba(255,255,255,0.15)" }}>
-            <span className="sm:hidden">Use the joystick to walk · drag anywhere to look around</span>
+            <span className="sm:hidden">Left stick to walk · right stick to look around</span>
             <span className="hidden sm:inline">Click to look around · <b>W A S D</b> move · <b>Shift</b> run · <b>Esc</b> release</span>
           </div>
         </div>
@@ -1528,13 +1533,22 @@ function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale,
       {/* exit */}
       <button onClick={onExit} className="absolute top-3 left-3 px-3 py-1.5 rounded-lg text-sm text-slate-200"
         style={{ background: "rgba(20,16,46,0.8)", border: "1px solid rgba(255,255,255,0.15)" }}>← Edit plan</button>
-      {/* touch joystick */}
-      <div ref={jBase}
-        onTouchStart={onJoy} onTouchMove={onJoy} onTouchEnd={endJoy}
-        className="absolute bottom-6 left-6 rounded-full sm:hidden"
-        style={{ width: 110, height: 110, background: "rgba(124,99,255,0.12)", border: "1px solid rgba(124,99,255,0.4)", touchAction: "none" }}>
-        <div className="absolute left-1/2 top-1/2 rounded-full" style={{ transform: "translate(-50%,-50%)", width: 40, height: 40, background: "rgba(124,99,255,0.5)" }} />
-      </div>
+      {/* twin touch joysticks (mobile): left = move, right = look */}
+      <Stick label="move" baseRef={moveBase} nubRef={moveNub} onTouch={onMoveStick} side="left" />
+      <Stick label="look" baseRef={lookBase} nubRef={lookNub} onTouch={onLookStick} side="right" />
+    </div>
+  );
+}
+
+// One on-screen joystick. Pinned above the home-indicator safe area; mobile only.
+function Stick({ label, baseRef, nubRef, onTouch, side }) {
+  return (
+    <div ref={baseRef}
+      onTouchStart={onTouch} onTouchMove={onTouch} onTouchEnd={onTouch} onTouchCancel={onTouch}
+      className={`absolute rounded-full sm:hidden ${side === "left" ? "left-6" : "right-6"}`}
+      style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)", width: 120, height: 120, background: "rgba(124,99,255,0.12)", border: "1px solid rgba(124,99,255,0.4)", touchAction: "none" }}>
+      <div ref={nubRef} className="absolute left-1/2 top-1/2 rounded-full" style={{ transform: "translate(-50%,-50%)", width: 46, height: 46, background: "rgba(124,99,255,0.55)" }} />
+      <span className="absolute left-1/2 rounded text-[10px] uppercase tracking-wide text-slate-300 pointer-events-none" style={{ transform: "translateX(-50%)", bottom: -18 }}>{label}</span>
     </div>
   );
 }
