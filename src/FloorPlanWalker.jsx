@@ -70,6 +70,31 @@ function pointSeg(px, py, ax, ay, bx, by) {
 let _id = 1;
 const nid = () => _id++;
 
+// ---------- saved plans (localStorage) ----------
+// Client-only persistence so the user can save a plan, leave, and come back to walk it again.
+// Lives in localStorage (no server, no new SaaS). Each entry: { id, name, savedAt, thumb, plan }.
+const PLANS_KEY = "bw_plans";
+function loadPlans() { try { return JSON.parse(localStorage.getItem(PLANS_KEY) || "[]"); } catch { return []; } }
+function tryPersist(list) { try { localStorage.setItem(PLANS_KEY, JSON.stringify(list)); return true; } catch { return false; } }
+
+// tiny wall-sketch thumbnail (a few KB) so the "My plans" list is recognisable at a glance,
+// without re-storing the big background photo as the preview image
+function makeThumb(plan, w = 160, h = 120) {
+  const walls = plan.walls || [];
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const x = c.getContext("2d");
+  x.fillStyle = "#15122e"; x.fillRect(0, 0, w, h);
+  if (walls.length) {
+    let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+    walls.forEach((s) => { minx = Math.min(minx, s.x1, s.x2); maxx = Math.max(maxx, s.x1, s.x2); miny = Math.min(miny, s.y1, s.y2); maxy = Math.max(maxy, s.y1, s.y2); });
+    const pad = 12, sc = Math.min((w - pad * 2) / ((maxx - minx) || 1), (h - pad * 2) / ((maxy - miny) || 1));
+    const ox = (w - (maxx - minx) * sc) / 2 - minx * sc, oy = (h - (maxy - miny) * sc) / 2 - miny * sc;
+    x.strokeStyle = "#c7b6ff"; x.lineWidth = 2; x.lineCap = "round";
+    walls.forEach((s) => { x.beginPath(); x.moveTo(s.x1 * sc + ox, s.y1 * sc + oy); x.lineTo(s.x2 * sc + ox, s.y2 * sc + oy); x.stroke(); });
+  }
+  return c.toDataURL("image/jpeg", 0.6);
+}
+
 // "Tidy up the drawing": square a wobbly hand trace without destroying deliberate diagonals.
 // - right-angle snap: a segment within SNAP_DEG of horizontal/vertical becomes exactly axis-aligned
 // - corner weld: endpoints within WELD_PX of each other collapse to their shared centroid (closes loops)
@@ -77,7 +102,7 @@ const nid = () => _id++;
 const TIDY_SNAP_DEG = 7;
 const TIDY_WELD_PX = 14;
 function tidyWalls(walls) {
-  const segs = walls.map((w) => ({ id: w.id, x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2 }));
+  const segs = walls.map((w) => ({ id: w.id, conf: w.conf, x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2 }));
   const snapAngles = () => {
     for (const s of segs) {
       const dx = s.x2 - s.x1, dy = s.y2 - s.y1;
@@ -123,6 +148,10 @@ export default function FloorPlanWalker() {
   const [ceiling, setCeiling] = useState(CEILING_FT_DEFAULT); // stored in feet; converted to meters in the 3D walk
   const [tidy, setTidy] = useState(true);        // "Tidy up the drawing": square the trace for display + build
   const [error, setError] = useState(null);
+  const [savedPlans, setSavedPlans] = useState(loadPlans); // localStorage-backed "My plans"
+  const [currentPlanId, setCurrentPlanId] = useState(null); // the saved entry we're editing, so Save overwrites it
+  const [currentName, setCurrentName] = useState("");       // its name (prefilled into the Save box)
+  const [saveStatus, setSaveStatus] = useState("");         // transient "Saved ✓" / quota message
   const [showIntro, setShowIntro] = useState(() => { try { return !localStorage.getItem("bw_intro_seen"); } catch { return false; } });
   const closeIntro = () => { try { localStorage.setItem("bw_intro_seen", "1"); } catch {} setShowIntro(false); };
 
@@ -145,6 +174,7 @@ export default function FloorPlanWalker() {
         cx.drawImage(im, 0, 0, w, h);
         setImg({ url: c.toDataURL("image/jpeg", 0.9), w, h });
         setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]); setScale(null);
+        setCurrentPlanId(null); setCurrentName(""); setSaveStatus(""); // a fresh photo is a new (unsaved) plan
       };
       im.src = e.target.result;
     };
@@ -167,7 +197,9 @@ export default function FloorPlanWalker() {
       });
       const p = await res.json();              // -> { w, d, win, furn, stairs, scale, rooms } | { error }
       if (!res.ok || p.error) throw new Error(p.error || ("server " + res.status));
-      const nw = (p.w || []).filter(a => a && a.length === 4).map(a => ({ id: nid(), x1: a[0], y1: a[1], x2: a[2], y2: a[3] }));
+      // walls: 5th element (conf 0–1) is optional/additive — older 4-element responses default to confident
+      const nw = (p.w || []).filter(a => Array.isArray(a) && a.length >= 4)
+        .map(a => ({ id: nid(), x1: a[0], y1: a[1], x2: a[2], y2: a[3], conf: (a.length >= 5 && isFinite(a[4])) ? Math.max(0, Math.min(1, a[4])) : 1 }));
       const no = [
         ...(p.d || []).map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 30, type: "door" })),
         ...(p.win || []).map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 30, type: "window" })),
@@ -196,7 +228,7 @@ export default function FloorPlanWalker() {
     const W = (x1, y1, x2, y2) => ({ id: nid(), x1, y1, x2, y2 });
     setWalls([
       W(120, 120, 904, 120), W(904, 120, 904, 600), W(904, 600, 120, 600), W(120, 600, 120, 120), // outer
-      W(512, 120, 512, 360), // hall divider
+      { ...W(512, 120, 512, 360), conf: 0.3 }, // hall divider — demo of an "uncertain" wall (orange/dashed)
       W(120, 360, 512, 360), // bed1 bottom
       W(512, 360, 904, 360), // bed2 bottom
       W(360, 360, 360, 600), // bath wall
@@ -226,6 +258,7 @@ export default function FloorPlanWalker() {
       { id: nid(), name: "Living", x: 700, y: 470 },
     ]);
     setScale({ pixelsPerUnit: 1024 / 12, unit: "m" }); // assume 12 m wide
+    setCurrentPlanId(null); setCurrentName(""); setSaveStatus("");
     setStage("editor");
   }, []);
 
@@ -261,8 +294,54 @@ export default function FloorPlanWalker() {
     setImg({ url: null, w: 40 * PXFT, h: 30 * PXFT, blank: true }); // ~40ft × 30ft drawing area
     setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]);
     setScale({ pixelsPerUnit: PXFT, unit: "ft" }); // 1 square = 1 ft, baked in
+    setCurrentPlanId(null); setCurrentName(""); setSaveStatus("");
     setStage("editor");
   }, []);
+
+  // ---- save / revisit (Phase 7) ----
+  // Save the current plan under a name. Overwrites the open saved entry if there is one,
+  // else creates a new one. If localStorage is full, retry without the (big) background photo.
+  const savePlan = useCallback((name) => {
+    const plan = { img, walls, openings, furniture, stairs, rooms, scale, ceiling, tidy };
+    const id = currentPlanId || ("p" + Date.now());
+    const others = savedPlans.filter((p) => p.id !== id);
+    const mk = (pl, dropped) => ({ id, name: (name || "").trim() || "My plan", savedAt: Date.now(), thumb: makeThumb(pl), plan: pl, photoDropped: !!dropped });
+    let entry = mk(plan, false);
+    let next = [entry, ...others].sort((a, b) => b.savedAt - a.savedAt);
+    if (tryPersist(next)) setSaveStatus("Saved ✓");
+    else {
+      const lite = { ...plan, img: plan.img ? { ...plan.img, url: null } : plan.img }; // drop the photo to fit
+      entry = mk(lite, true);
+      next = [entry, ...others].sort((a, b) => b.savedAt - a.savedAt);
+      if (tryPersist(next)) setSaveStatus("Saved (without the photo, to save space).");
+      else { setSaveStatus("Storage is full — delete a saved plan and try again."); return; }
+    }
+    setSavedPlans(next); setCurrentPlanId(id); setCurrentName(entry.name);
+  }, [img, walls, openings, furniture, stairs, rooms, scale, ceiling, tidy, currentPlanId, savedPlans]);
+
+  // Open a saved plan back into the editor (or straight into the walk). Re-id every piece via nid()
+  // so the session's id counter can never collide with ids saved in a previous session.
+  const openPlan = useCallback((entry, walk) => {
+    const p = entry.plan || {};
+    const remap = (arr) => (arr || []).map((o) => ({ ...o, id: nid() }));
+    setImg(p.img || null);
+    setWalls(remap(p.walls)); setOpenings(remap(p.openings));
+    setFurniture(remap(p.furniture)); setStairs(remap(p.stairs)); setRooms(remap(p.rooms));
+    setScale(p.scale || null); setCeiling(p.ceiling ?? CEILING_FT_DEFAULT); setTidy(p.tidy ?? true);
+    setCurrentPlanId(entry.id); setCurrentName(entry.name); setSaveStatus(""); setError(null);
+    setStage(walk && (p.walls || []).length >= 3 ? "walk" : "editor");
+  }, []);
+
+  const renamePlan = useCallback((id, name) => {
+    const clean = (name || "").trim(); if (!clean) return;
+    setSavedPlans((list) => { const next = list.map((p) => p.id === id ? { ...p, name: clean } : p); tryPersist(next); return next; });
+    setCurrentName((cn) => (id === currentPlanId ? clean : cn));
+  }, [currentPlanId]);
+
+  const deletePlan = useCallback((id) => {
+    setSavedPlans((list) => { const next = list.filter((p) => p.id !== id); tryPersist(next); return next; });
+    if (id === currentPlanId) { setCurrentPlanId(null); setCurrentName(""); }
+  }, [currentPlanId]);
 
   return (
     <div style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
@@ -272,7 +351,8 @@ export default function FloorPlanWalker() {
         {showIntro && <Welcome onClose={closeIntro} />}
         <Header stage={stage} onHelp={() => setShowIntro(true)} />
         {stage === "upload" && (
-          <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank} onReset={() => setImg(null)} />
+          <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank} onReset={() => setImg(null)}
+            savedPlans={savedPlans} onOpenPlan={openPlan} onRenamePlan={renamePlan} onDeletePlan={deletePlan} />
         )}
         {stage === "analyzing" && <Analyzing />}
         {stage === "editor" && (
@@ -285,6 +365,7 @@ export default function FloorPlanWalker() {
             scale={scale} setScale={setScale}
             ceiling={ceiling} setCeiling={setCeiling}
             error={error} onRotate={rotatePlan}
+            savedName={currentName} onSave={savePlan} saveStatus={saveStatus}
             onWalk={() => setStage("walk")}
             onBack={() => { setStage("upload"); }}
           />
@@ -357,7 +438,7 @@ function Header({ stage, onHelp }) {
 }
 
 // ---------- upload ----------
-function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset }) {
+function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
   const fileRef = useRef(null), camRef = useRef(null);
   const [drag, setDrag] = useState(false);
   const drop = (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); };
@@ -386,6 +467,32 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset }) {
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
             <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
           </div>
+          {savedPlans.length > 0 && (
+            <div className="mt-8">
+              <h2 className="text-sm font-medium text-slate-300 mb-3">My plans</h2>
+              <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}>
+                {savedPlans.map((p) => (
+                  <div key={p.id} className="rounded-xl overflow-hidden flex flex-col" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.12)" }}>
+                    <button onClick={() => onOpenPlan?.(p, false)} title="Open this plan" className="block w-full">
+                      <img src={p.thumb} alt={p.name} className="w-full block" style={{ aspectRatio: "4 / 3", objectFit: "cover" }} />
+                    </button>
+                    <div className="px-2.5 py-2 flex flex-col gap-2">
+                      <div className="min-w-0">
+                        <div className="text-sm text-slate-100 truncate">{p.name}</div>
+                        <div className="text-[11px] text-slate-500">{new Date(p.savedAt).toLocaleDateString()}{p.photoDropped ? " · no photo" : ""}</div>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <button onClick={() => onOpenPlan?.(p, false)} className="flex-1 px-2 py-1 rounded text-xs font-medium text-white" style={{ background: "#6d5ae6" }}>Open</button>
+                        <button onClick={() => onOpenPlan?.(p, true)} title="Walk it now" className="px-2 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.16)", border: "1px solid rgba(124,255,203,0.4)" }}>Walk</button>
+                        <button onClick={() => { const n = window.prompt("Rename this plan:", p.name); if (n != null) onRenamePlan?.(p.id, n); }} title="Rename" className="px-2 py-1 rounded text-xs text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>✎</button>
+                        <button onClick={() => { if (window.confirm(`Delete “${p.name}”? This can't be undone.`)) onDeletePlan?.(p.id); }} title="Delete" className="px-2 py-1 rounded text-xs" style={{ background: "rgba(180,68,78,0.18)", border: "1px solid rgba(180,68,78,0.4)", color: "#ffb4ba" }}>🗑</button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </>
       ) : (
         <div className="text-center">
@@ -414,8 +521,10 @@ function Analyzing() {
 }
 
 // ================= 2D EDITOR =================
-function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRotate, onWalk, onBack }) {
+function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRotate, savedName = "", onSave, saveStatus = "", onWalk, onBack }) {
   const canvasRef = useRef(null);
+  const [saving, setSaving] = useState(false);          // inline "name this plan" panel open?
+  const [nameDraft, setNameDraft] = useState(savedName); // editable name in the Save panel
   const wrapRef = useRef(null);
   const tf = useRef({ s: 1, ox: 0, oy: 0 });      // plan→screen transform (fit × user zoom/pan)
   const fit = useRef({ s: 1, ox: 0, oy: 0 });      // base "whole plan fits" transform
@@ -529,21 +638,27 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     const overlay = tidy && tidied.length > 0;
     const selWallId = selected?.kind === "wall" ? selected.id : null;
     const selOpenId = selected?.kind === "opening" ? selected.id : null;
+    const UNC = "#fbbf24";                       // walls the model wasn't sure about → amber + dashed
+    const isUnc = (w) => (w.conf ?? 1) < 0.6;    // missing conf (older plans) = confident
     walls.forEach((w) => {
       const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2);
-      const isSel = w.id === selWallId;
-      x.strokeStyle = (!overlay && isSel) ? "#7CFFCB" : (overlay ? "rgba(199,182,255,0.28)" : "#c7b6ff");
-      x.lineWidth = (!overlay && isSel) ? 6 : (overlay ? 2 : 5);
-      x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
-      [a, b].forEach((p) => { x.fillStyle = isSel ? "#7CFFCB" : "#1b1640"; x.strokeStyle = isSel ? "#0c0a1f" : "#a48bff"; x.lineWidth = 2;
+      const isSel = w.id === selWallId, unc = isUnc(w);
+      // raw layer: bold when tidy is off, a faint underlay when the squared overlay is on
+      if (overlay) { x.strokeStyle = unc ? "rgba(251,191,36,0.32)" : "rgba(199,182,255,0.28)"; x.lineWidth = 2; x.setLineDash([]); }
+      else if (isSel) { x.strokeStyle = "#7CFFCB"; x.lineWidth = 6; x.setLineDash([]); }
+      else if (unc) { x.strokeStyle = UNC; x.lineWidth = 5; x.setLineDash([9, 7]); }
+      else { x.strokeStyle = "#c7b6ff"; x.lineWidth = 5; x.setLineDash([]); }
+      x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke(); x.setLineDash([]);
+      [a, b].forEach((p) => { x.fillStyle = isSel ? "#7CFFCB" : "#1b1640"; x.strokeStyle = isSel ? "#0c0a1f" : (unc && !overlay ? UNC : "#a48bff"); x.lineWidth = 2;
         x.beginPath(); x.rect(p.x - (isSel ? 5 : 4), p.y - (isSel ? 5 : 4), isSel ? 10 : 8, isSel ? 10 : 8); x.fill(); x.stroke(); });
     });
     if (overlay) {
       tidied.forEach((w) => {
         const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2);
-        const isSel = w.id === selWallId;
-        x.strokeStyle = isSel ? "#7CFFCB" : "#c7b6ff"; x.lineWidth = isSel ? 6 : 5;
-        x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
+        const isSel = w.id === selWallId, unc = isUnc(w);
+        x.strokeStyle = isSel ? "#7CFFCB" : (unc ? UNC : "#c7b6ff"); x.lineWidth = isSel ? 6 : 5;
+        x.setLineDash(unc && !isSel ? [9, 7] : []);
+        x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke(); x.setLineDash([]);
       });
     }
     // draft wall
@@ -744,9 +859,10 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     const d = drag.current;
     if (d.type === "endpoint") {
       const gx = snapGrid(x), gy = snapGrid(y);
-      setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: gx, y1: gy } : { ...w, x2: gx, y2: gy }) : w));
+      // editing a wall counts as reviewing it → clear any "uncertain" flag (conf:1)
+      setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: gx, y1: gy, conf: 1 } : { ...w, x2: gx, y2: gy, conf: 1 }) : w));
     } else if (d.type === "wallmove") {
-      setWalls((ws) => ws.map((w) => w.id === d.id ? { ...w, x1: x + d.gx1, y1: y + d.gy1, x2: x + d.gx2, y2: y + d.gy2 } : w));
+      setWalls((ws) => ws.map((w) => w.id === d.id ? { ...w, x1: x + d.gx1, y1: y + d.gy1, x2: x + d.gx2, y2: y + d.gy2, conf: 1 } : w));
     } else if (d.type === "newwall") {
       drag.current = { ...d, x2: snapGrid(x), y2: snapGrid(y) }; draw();
     } else if (d.type === "scale") {
@@ -810,6 +926,8 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     dims = `${ftIn(toFeet(maxx - minx))} × ${ftIn(toFeet(maxy - miny))}`;
   }
 
+  const uncertainCount = walls.filter((w) => (w.conf ?? 1) < 0.6).length;
+
   const tools = [["move", "Move"], ["wall", "Add wall"], ["door", "Door"], ["window", "Window"], ["scale", "Set scale"], ["erase", "Erase"]];
 
   return (
@@ -824,6 +942,10 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           </button>
         ))}
         <div className="flex-1" />
+        <button onClick={() => { setNameDraft(savedName || ""); setSaving(true); }} title="Save this plan to come back to later"
+          className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
+          💾 Save
+        </button>
         <button onClick={onRotate} title="Rotate the whole plan 90°"
           className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
           ↻ Rotate
@@ -835,6 +957,19 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           <input type="checkbox" checked={showImg} onChange={(e) => setShowImg(e.target.checked)} /> show drawing
         </label>
       </div>
+
+      {saving && (
+        <div className="mb-3 rounded-lg px-3 py-3 text-sm flex flex-wrap items-center gap-2" style={{ background: "rgba(124,99,255,0.1)", border: "1px solid rgba(124,99,255,0.3)" }}>
+          <span className="text-slate-200">Name this plan:</span>
+          <input autoFocus value={nameDraft} onChange={(e) => setNameDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") onSave?.(nameDraft); }}
+            placeholder="e.g. Our house" className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
+          <button onClick={() => onSave?.(nameDraft)} className="px-3 py-1 rounded text-white" style={{ background: "#6d5ae6" }}>Save</button>
+          <button onClick={() => setSaving(false)} className="px-3 py-1 rounded text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Close</button>
+          {saveStatus && <span style={{ color: "#7CFFCB" }}>{saveStatus}</span>}
+          <span className="w-full text-xs text-slate-400">Saved on this device — find it under “My plans” on the start screen.</span>
+        </div>
+      )}
 
       <div ref={wrapRef} className="rounded-xl overflow-hidden relative" style={{ border: "1px solid rgba(255,255,255,0.12)", touchAction: "none" }}>
         <canvas ref={canvasRef}
@@ -860,9 +995,10 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         else if (selected.kind === "opening") { const o = openings.find((p) => p.id === selected.id); sel = o && { kind: "opening", o }; }
         else sel = boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
         if (!sel) return null;
+        const wallUnsure = sel.kind === "wall" && (sel.o.conf ?? 1) < 0.6;
         const label = sel.kind === "furn" ? "Furniture" : sel.kind === "stair" ? "Staircase"
-          : sel.kind === "wall" ? "Wall" : (sel.o.type === "door" ? "Door" : "Window");
-        const hint = sel.kind === "wall" ? "drag the wall to move it · drag an end to reshape"
+          : sel.kind === "wall" ? (wallUnsure ? "Wall (unsure)" : "Wall") : (sel.o.type === "door" ? "Door" : "Window");
+        const hint = sel.kind === "wall" ? (wallUnsure ? "we weren't sure about this one — fix it, or tap “looks right”" : "drag the wall to move it · drag an end to reshape")
           : sel.kind === "opening" ? "drag it along a wall to move it"
           : "drag the box to move · drag a corner to resize";
         return (
@@ -880,6 +1016,12 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
               <button onClick={() => setOpenings((o) => o.map((q) => q.id === sel.o.id ? { ...q, type: q.type === "door" ? "window" : "door" } : q))}
                 className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)" }}>
                 make it a {sel.o.type === "door" ? "window" : "door"}
+              </button>
+            )}
+            {wallUnsure && (
+              <button onClick={() => setWalls((a) => a.map((w) => w.id === sel.o.id ? { ...w, conf: 1 } : w))}
+                className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.18)", border: "1px solid rgba(124,255,203,0.45)" }}>
+                looks right ✓
               </button>
             )}
             <span className="text-slate-400 text-xs">{hint}</span>
@@ -961,6 +1103,9 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           <span style={{ color: "#7CFFCB" }}>Real size set{dims ? ` · about ${dims}` : ""}</span>
         ) : (
           <span style={{ color: "#fbbf24" }}>Tap “Set scale” to tell us the real size (otherwise it's a guess)</span>
+        )}
+        {uncertainCount > 0 && (
+          <span style={{ color: "#fbbf24" }}>⚠ {uncertainCount} wall{uncertainCount > 1 ? "s" : ""} {uncertainCount > 1 ? "look" : "looks"} uncertain (orange &amp; dashed) — tap to check</span>
         )}
         <label className="text-slate-400 flex items-center gap-2 ml-auto">ceiling
           <input type="range" min="7" max="11" step="0.5" value={ceiling} onChange={(e) => setCeiling(parseFloat(e.target.value))} />

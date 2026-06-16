@@ -32,13 +32,13 @@ const FURN_TYPES = [
 function buildPrompt(width, height) {
   return `You vectorize ONE FLOOR of a house floor plan, often hand-drawn on graph/grid paper. The image is ${width}px wide, ${height}px tall. Origin top-left, x right, y down.
 Return ONLY compact JSON, no markdown, no prose:
-{"w":[[x1,y1,x2,y2]],"d":[[cx,cy,wpx]],"win":[[cx,cy,wpx]],"furn":[["type",cx,cy,wpx,hpx,deg]],"stairs":[[cx,cy,wpx,hpx,deg]],"scale":{"px":N,"unit":"ft","len":N},"rooms":[["Name",cx,cy]]}
+{"w":[[x1,y1,x2,y2,conf?]],"d":[[cx,cy,wpx]],"win":[[cx,cy,wpx]],"furn":[["type",cx,cy,wpx,hpx,deg]],"stairs":[[cx,cy,wpx,hpx,deg]],"scale":{"px":N,"unit":"ft","len":N},"rooms":[["Name",cx,cy]]}
 
 CRITICAL — separate the BUILDING SHELL from its CONTENTS:
 - The faint, evenly-spaced graph-paper grid is NOT walls. Ignore it completely. Only bold/dark pen strokes are real.
 - WALLS are the structural lines that enclose rooms (exterior perimeter + interior partitions). Furniture, fixtures, appliances, and stair treads are NOT walls — never put them in "w".
 
-- "w": structural walls only, each a straight segment [x1,y1,x2,y2] in pixels. Trace the full outer perimeter AND interior partition walls. Merge collinear runs; the drawing is on a grid so walls are almost always horizontal or vertical — snap them to exact right angles.
+- "w": structural walls only, each a straight segment [x1,y1,x2,y2] in pixels. Trace the full outer perimeter AND interior partition walls. Merge collinear runs; the drawing is on a grid so walls are almost always horizontal or vertical — snap them to exact right angles. You MAY append a 5th number conf (0–1) = how sure you are this is a real wall: omit it (or use 1) when confident; use a low value (~0.3) for faint, broken, smudged, ambiguous, or partly-guessed segments so the user knows to double-check them. Confidence never excludes a line — still include uncertain walls, just flag them with a low conf.
 - "d": door openings as [centerX, centerY, approxWidthPx]. Doorways are gaps in a wall, often with a quarter-circle swing arc — the arc marks a door, not a wall.
 - "win": window openings as [centerX, centerY, approxWidthPx]. Windows are usually thin double-lines or breaks drawn within an exterior wall.
 - "furn": every piece of furniture/fixture/appliance, each as ["type", centerX, centerY, widthPx, heightPx, rotationDeg]. widthPx/heightPx are the bounding-box size in pixels (before rotation); rotationDeg is 0 if axis-aligned. "type" MUST be one of: ${FURN_TYPES.join(", ")} (use "other" if unsure). Common sketch cues: a rectangle with a curved pillow line = bed; an L or long block of cushions = sofa; small squares/diamonds by a sofa = armchair/chair; a rectangle ringed by small ovals = dining table+chairs; an oval/rounded-rectangle in a bathroom = tub; a U-shape or rounded form with a small tank = toilet; one or two ovals in a counter = sink(s); 4 small circles = stove burners; a long thin block along a wall = counter. Capture the cooktop, tubs, toilets, sinks, beds, sofas, chairs, tables, etc.
