@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import * as THREE from "three";
 
 /*  Blueprint → Walkable 3D  ·  end-to-end pipeline prototype
@@ -10,13 +10,52 @@ import * as THREE from "three";
 
 // ---------- constants ----------
 const MAX_DIM = 1024;          // downscale source image to this max dimension before vision + editing
-const CEILING_M = 2.7;         // default ceiling height (m)
-const WALL_T_M = 0.12;         // wall thickness (m)
-const DOOR_TOP_M = 2.05;       // top of a door opening
-const WIN_SILL_M = 0.9;        // bottom of a window opening
-const WIN_TOP_M = 2.1;         // top of a window opening
-const EYE_M = 1.6;             // camera eye height
+const CEILING_FT_DEFAULT = 8;  // default ceiling height (ft) — she thinks in feet
 const FT_TO_M = 0.3048;
+const IN_TO_M = 0.0254;
+const WALL_T_M = 0.12;          // interior wall thickness (~4.7")
+// Residential door/window standards (inches → m). Doors are 36"×80"; openings get an 80" head.
+// Windows sit on a ~32" sill with the head aligned to the door head at 80". Default ADD widths use
+// a common 32" interior door and 36" window; widths read from a real drawing are kept as-drawn.
+const DOOR_TOP_M = 80 * IN_TO_M;   // door head height (80")
+const WIN_SILL_M = 32 * IN_TO_M;   // window sill height (32")
+const WIN_TOP_M = 80 * IN_TO_M;    // window head height (80", aligned with doors)
+const DOOR_W_M = 32 * IN_TO_M;     // default width when adding a door (32" interior)
+const WIN_W_M = 36 * IN_TO_M;      // default width when adding a window (36" general)
+const EYE_M = 1.6;              // camera eye height (~63")
+
+// Format a length in decimal feet as plain feet-and-inches, e.g. 13.5 -> 13' 6".
+// Rounds to the nearest inch and rolls 12" up to the next foot.
+function ftIn(feet) {
+  if (!isFinite(feet)) return "—";
+  let totalIn = Math.round(feet * 12);
+  const ft = Math.floor(totalIn / 12);
+  const inch = totalIn - ft * 12;
+  return inch ? `${ft}' ${inch}"` : `${ft}'`;
+}
+
+// How each furniture type is drawn as a simple 3D block: height (m) + color.
+const FURN_3D = {
+  bed: { h: 0.55, color: 0x6d7fa6 }, sofa: { h: 0.80, color: 0x5f76a0 }, armchair: { h: 0.85, color: 0x5f76a0 },
+  chair: { h: 0.90, color: 0x7c6f5a }, table: { h: 0.75, color: 0x9b7653 }, coffee_table: { h: 0.42, color: 0x9b7653 },
+  desk: { h: 0.75, color: 0x9b7653 }, dresser: { h: 0.90, color: 0x9b7653 }, nightstand: { h: 0.50, color: 0x9b7653 },
+  wardrobe: { h: 2.00, color: 0x8a6a4a }, bookshelf: { h: 1.80, color: 0x8a6a4a }, tv: { h: 1.10, color: 0x2b2b33 },
+  toilet: { h: 0.42, color: 0xeef2f5 }, tub: { h: 0.52, color: 0xeef2f5 }, shower: { h: 2.00, color: 0xcfe6f5 },
+  sink: { h: 0.85, color: 0xeef2f5 }, counter: { h: 0.90, color: 0xcfc9bb }, stove: { h: 0.90, color: 0x9aa3ad },
+  fridge: { h: 1.80, color: 0x9aa3ad }, rug: { h: 0.02, color: 0x8a5a6a }, other: { h: 0.55, color: 0x8a8597 },
+};
+const FURN_TYPE_LIST = Object.keys(FURN_3D);
+
+// geometry for a furniture/stairs box {x,y,w,h,deg} (deg = clockwise, plan space)
+function boxCorners(o) {
+  const d = ((o.deg || 0) * Math.PI) / 180, c = Math.cos(d), s = Math.sin(d), hw = o.w / 2, hh = o.h / 2;
+  return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) => ({ sx, sy, x: o.x + sx * hw * c - sy * hh * s, y: o.y + sx * hw * s + sy * hh * c }));
+}
+function boxInside(px, py, o) {
+  const d = ((o.deg || 0) * Math.PI) / 180, dx = px - o.x, dy = py - o.y;
+  const lx = dx * Math.cos(d) + dy * Math.sin(d), ly = -dx * Math.sin(d) + dy * Math.cos(d);
+  return Math.abs(lx) <= o.w / 2 && Math.abs(ly) <= o.h / 2;
+}
 
 // ---------- small geometry helpers ----------
 function pointSeg(px, py, ax, ay, bx, by) {
@@ -31,15 +70,62 @@ function pointSeg(px, py, ax, ay, bx, by) {
 let _id = 1;
 const nid = () => _id++;
 
+// "Tidy up the drawing": square a wobbly hand trace without destroying deliberate diagonals.
+// - right-angle snap: a segment within SNAP_DEG of horizontal/vertical becomes exactly axis-aligned
+// - corner weld: endpoints within WELD_PX of each other collapse to their shared centroid (closes loops)
+// Pure + index/id-preserving (no merging), so the editor can keep editing the raw walls underneath.
+const TIDY_SNAP_DEG = 7;
+const TIDY_WELD_PX = 14;
+function tidyWalls(walls) {
+  const segs = walls.map((w) => ({ id: w.id, x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2 }));
+  const snapAngles = () => {
+    for (const s of segs) {
+      const dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+      if (Math.hypot(dx, dy) < 1e-6) continue;
+      const a = ((Math.atan2(dy, dx) * 180) / Math.PI % 180 + 180) % 180; // 0..180
+      if (Math.min(a, 180 - a) <= TIDY_SNAP_DEG) { const my = (s.y1 + s.y2) / 2; s.y1 = my; s.y2 = my; }      // → horizontal
+      else if (Math.abs(a - 90) <= TIDY_SNAP_DEG) { const mx = (s.x1 + s.x2) / 2; s.x1 = mx; s.x2 = mx; }      // → vertical
+    }
+  };
+  const weld = () => {
+    const pts = [];
+    for (const s of segs) { pts.push({ s, k: 1 }); pts.push({ s, k: 2 }); }
+    const X = (p) => (p.k === 1 ? p.s.x1 : p.s.x2), Y = (p) => (p.k === 1 ? p.s.y1 : p.s.y2);
+    const used = new Array(pts.length).fill(false);
+    for (let i = 0; i < pts.length; i++) {
+      if (used[i]) continue;
+      const cluster = [i]; used[i] = true;
+      for (let j = i + 1; j < pts.length; j++) {
+        if (!used[j] && Math.hypot(X(pts[i]) - X(pts[j]), Y(pts[i]) - Y(pts[j])) <= TIDY_WELD_PX) { cluster.push(j); used[j] = true; }
+      }
+      if (cluster.length > 1) {
+        let cx = 0, cy = 0;
+        for (const k of cluster) { cx += X(pts[k]); cy += Y(pts[k]); }
+        cx /= cluster.length; cy /= cluster.length;
+        for (const k of cluster) { const p = pts[k]; if (p.k === 1) { p.s.x1 = cx; p.s.y1 = cy; } else { p.s.x2 = cx; p.s.y2 = cy; } }
+      }
+    }
+  };
+  snapAngles(); weld(); snapAngles(); weld(); // settle axes then corners; end on a weld so corners close exactly
+  return segs;
+}
+
 // ---------- root component ----------
 export default function FloorPlanWalker() {
   const [stage, setStage] = useState("upload"); // upload | analyzing | editor | walk
   const [img, setImg] = useState(null);         // { url, w, h }
   const [walls, setWalls] = useState([]);        // { id, x1,y1,x2,y2 } in plan px
   const [openings, setOpenings] = useState([]);  // { id, x,y,w, type:'door'|'window' } center in plan px
+  const [furniture, setFurniture] = useState([]); // { id, type, x,y, w,h, deg } center+size in plan px
+  const [stairs, setStairs] = useState([]);       // { id, x,y, w,h, deg } stair runs in plan px
+  const [rooms, setRooms] = useState([]);          // { id, name, x,y } room labels in plan px
   const [scale, setScale] = useState(null);      // { pixelsPerUnit, unit:'ft'|'m' }
-  const [ceiling, setCeiling] = useState(CEILING_M);
+  const [ceiling, setCeiling] = useState(CEILING_FT_DEFAULT); // stored in feet; converted to meters in the 3D walk
+  const [tidy, setTidy] = useState(true);        // "Tidy up the drawing": square the trace for display + build
   const [error, setError] = useState(null);
+
+  // squared walls used for the 3D build and the editor's "after" preview; raw walls stay editable
+  const tidied = useMemo(() => (tidy ? tidyWalls(walls) : walls), [tidy, walls]);
 
   // ---- image intake (downscale to a consistent working resolution) ----
   const ingest = useCallback((file) => {
@@ -56,7 +142,7 @@ export default function FloorPlanWalker() {
         cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h);
         cx.drawImage(im, 0, 0, w, h);
         setImg({ url: c.toDataURL("image/jpeg", 0.9), w, h });
-        setWalls([]); setOpenings([]); setScale(null);
+        setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]); setScale(null);
       };
       im.src = e.target.result;
     };
@@ -77,14 +163,21 @@ export default function FloorPlanWalker() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ imageBase64: base64, mediaType: "image/jpeg", width: img.w, height: img.h }),
       });
-      const p = await res.json();              // -> { w, d, win, scale, rooms } | { error }
+      const p = await res.json();              // -> { w, d, win, furn, stairs, scale, rooms } | { error }
       if (!res.ok || p.error) throw new Error(p.error || ("server " + res.status));
       const nw = (p.w || []).filter(a => a && a.length === 4).map(a => ({ id: nid(), x1: a[0], y1: a[1], x2: a[2], y2: a[3] }));
       const no = [
         ...(p.d || []).map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 30, type: "door" })),
         ...(p.win || []).map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 30, type: "window" })),
       ];
-      setWalls(nw); setOpenings(no);
+      // furniture / stairs / rooms are additive: older responses omit them and still work
+      const nf = (p.furn || []).filter(a => Array.isArray(a) && a.length >= 5)
+        .map(a => ({ id: nid(), type: String(a[0] || "other"), x: a[1], y: a[2], w: a[3] || 24, h: a[4] || 24, deg: a[5] || 0 }));
+      const ns = (p.stairs || []).filter(a => Array.isArray(a) && a.length >= 4)
+        .map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 40, h: a[3] || 60, deg: a[4] || 0 }));
+      const nr = (p.rooms || []).filter(a => Array.isArray(a) && a.length >= 3)
+        .map(a => ({ id: nid(), name: String(a[0] || ""), x: a[1], y: a[2] }));
+      setWalls(nw); setOpenings(no); setFurniture(nf); setStairs(ns); setRooms(nr);
       if (p.scale && p.scale.px && p.scale.len) {
         setScale({ pixelsPerUnit: p.scale.px / p.scale.len, unit: p.scale.unit === "m" ? "m" : "ft" });
       }
@@ -115,7 +208,31 @@ export default function FloorPlanWalker() {
       { id: nid(), x: 700, y: 120, w: 70, type: "window" },
       { id: nid(), x: 904, y: 480, w: 70, type: "window" },
     ]);
+    setFurniture([
+      { id: nid(), type: "bed", x: 300, y: 235, w: 150, h: 110, deg: 0 },
+      { id: nid(), type: "bed", x: 712, y: 235, w: 150, h: 110, deg: 0 },
+      { id: nid(), type: "tub", x: 250, y: 440, w: 60, h: 120, deg: 0 },
+      { id: nid(), type: "toilet", x: 250, y: 560, w: 36, h: 50, deg: 0 },
+      { id: nid(), type: "sofa", x: 700, y: 500, w: 190, h: 70, deg: 0 },
+      { id: nid(), type: "table", x: 460, y: 480, w: 90, h: 60, deg: 0 },
+    ]);
+    setStairs([{ id: nid(), x: 450, y: 220, w: 90, h: 150, deg: 0 }]);
+    setRooms([
+      { id: nid(), name: "Bedroom", x: 300, y: 250 },
+      { id: nid(), name: "Bedroom", x: 712, y: 250 },
+      { id: nid(), name: "Bath", x: 250, y: 500 },
+      { id: nid(), name: "Living", x: 700, y: 470 },
+    ]);
     setScale({ pixelsPerUnit: 1024 / 12, unit: "m" }); // assume 12 m wide
+    setStage("editor");
+  }, []);
+
+  // start from a blank 1-ft grid (no photo) — everything she draws is already to scale
+  const startBlank = useCallback(() => {
+    const PXFT = 24; // pixels per foot of the blank canvas (1 grid square)
+    setImg({ url: null, w: 40 * PXFT, h: 30 * PXFT, blank: true }); // ~40ft × 30ft drawing area
+    setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]);
+    setScale({ pixelsPerUnit: PXFT, unit: "ft" }); // 1 square = 1 ft, baked in
     setStage("editor");
   }, []);
 
@@ -126,13 +243,16 @@ export default function FloorPlanWalker() {
       <div className="min-h-screen w-full" style={{ background: "radial-gradient(1200px 600px at 70% -10%, #2a1f5e 0%, #15122e 45%, #0c0a1f 100%)" }}>
         <Header stage={stage} />
         {stage === "upload" && (
-          <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onReset={() => setImg(null)} />
+          <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank} onReset={() => setImg(null)} />
         )}
         {stage === "analyzing" && <Analyzing />}
         {stage === "editor" && (
           <Editor
-            img={img} walls={walls} setWalls={setWalls}
+            img={img} walls={walls} setWalls={setWalls} tidied={tidied} tidy={tidy} setTidy={setTidy}
             openings={openings} setOpenings={setOpenings}
+            furniture={furniture} setFurniture={setFurniture}
+            stairs={stairs} setStairs={setStairs}
+            rooms={rooms} setRooms={setRooms}
             scale={scale} setScale={setScale}
             ceiling={ceiling} setCeiling={setCeiling}
             error={error}
@@ -141,7 +261,7 @@ export default function FloorPlanWalker() {
           />
         )}
         {stage === "walk" && (
-          <Walk walls={walls} openings={openings} scale={scale} ceiling={ceiling} onExit={() => setStage("editor")} />
+          <Walk walls={tidied} openings={openings} furniture={furniture} stairs={stairs} rooms={rooms} scale={scale} ceiling={ceiling} onExit={() => setStage("editor")} />
         )}
       </div>
     </div>
@@ -175,7 +295,7 @@ function Header({ stage }) {
 }
 
 // ---------- upload ----------
-function Upload({ img, onFile, onAnalyze, onSample, onReset }) {
+function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset }) {
   const fileRef = useRef(null), camRef = useRef(null);
   const [drag, setDrag] = useState(false);
   const drop = (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); };
@@ -197,8 +317,10 @@ function Upload({ img, onFile, onAnalyze, onSample, onReset }) {
             <div className="flex flex-wrap gap-3 justify-center">
               <button onClick={() => fileRef.current?.click()} className="px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "#6d5ae6" }}>Choose file</button>
               <button onClick={() => camRef.current?.click()} className="px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>Take a photo</button>
+              <button onClick={onBlank} className="px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(124,255,203,0.14)", border: "1px solid rgba(124,255,203,0.4)" }}>Draw a new plan</button>
               <button onClick={onSample} className="px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Try a sample</button>
             </div>
+            <div className="text-slate-500 text-xs mt-4">“Draw a new plan” gives you a blank grid where 1 square = 1 foot — no photo needed.</div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
             <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
           </div>
@@ -230,15 +352,17 @@ function Analyzing() {
 }
 
 // ================= 2D EDITOR =================
-function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, ceiling, setCeiling, error, onWalk, onBack }) {
+function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onWalk, onBack }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
   const tf = useRef({ s: 1, ox: 0, oy: 0 });      // plan→screen transform
   const drag = useRef(null);                       // active interaction
   const [tool, setTool] = useState("move");
   const [showImg, setShowImg] = useState(true);
+  const [selected, setSelected] = useState(null); // { kind:'furn'|'stair', id } currently-selected box
   const [scaleDraft, setScaleDraft] = useState(null); // {x1,y1,x2,y2}
-  const [scaleInput, setScaleInput] = useState({ len: "", unit: scale?.unit || "ft" });
+  const [scaleMode, setScaleMode] = useState("grid"); // "grid" (1 square = N ft) | "wall" (known length)
+  const [scaleInput, setScaleInput] = useState({ len: "", unit: scale?.unit || "ft", squares: "", ftPerSq: 1 });
   const [size, setSize] = useState({ w: 800, h: 560 });
   const bg = useRef(null);
 
@@ -285,15 +409,60 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
       x.drawImage(bg.current, tf.current.ox, tf.current.oy, img.w * tf.current.s, img.h * tf.current.s);
       x.globalAlpha = 1;
     }
-    // walls
+    // blank-canvas reference grid (no photo): one line per scale-unit (1 ft in "Draw a new plan")
+    if (!bg.current && scale && img && scale.pixelsPerUnit * tf.current.s > 4) {
+      const step = scale.pixelsPerUnit;
+      x.strokeStyle = "rgba(199,182,255,0.10)"; x.lineWidth = 1; x.beginPath();
+      for (let gx = 0; gx <= img.w + 0.5; gx += step) { const a = toScreen(gx, 0), b = toScreen(gx, img.h); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); }
+      for (let gy = 0; gy <= img.h + 0.5; gy += step) { const a = toScreen(0, gy), b = toScreen(img.w, gy); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); }
+      x.stroke();
+    }
+    // furniture (drawn under the walls): translucent boxes with a type label
+    furniture.forEach((f) => {
+      const c = toScreen(f.x, f.y);
+      const w = f.w * tf.current.s, h = f.h * tf.current.s;
+      x.save(); x.translate(c.x, c.y); x.rotate((f.deg || 0) * Math.PI / 180);
+      x.fillStyle = "rgba(94,234,212,0.14)"; x.strokeStyle = "rgba(94,234,212,0.75)"; x.lineWidth = 1.5;
+      x.beginPath(); x.rect(-w / 2, -h / 2, w, h); x.fill(); x.stroke();
+      x.restore();
+      x.fillStyle = "rgba(190,255,242,0.92)"; x.font = "10px ui-sans-serif, system-ui, sans-serif";
+      x.textAlign = "center"; x.textBaseline = "middle";
+      x.fillText(f.type, c.x, c.y);
+    });
+    // staircases: amber box with tread hints + label (a feature, never a wall)
+    stairs.forEach((s) => {
+      const c = toScreen(s.x, s.y);
+      const w = s.w * tf.current.s, h = s.h * tf.current.s;
+      x.save(); x.translate(c.x, c.y); x.rotate((s.deg || 0) * Math.PI / 180);
+      x.fillStyle = "rgba(251,146,60,0.16)"; x.strokeStyle = "rgba(251,146,60,0.8)"; x.lineWidth = 1.5;
+      x.beginPath(); x.rect(-w / 2, -h / 2, w, h); x.fill(); x.stroke();
+      const n = Math.max(2, Math.min(12, Math.round(Math.max(w, h) / 12)));
+      x.beginPath();
+      for (let i = 1; i < n; i++) { const yy = -h / 2 + (h * i / n); x.moveTo(-w / 2, yy); x.lineTo(w / 2, yy); }
+      x.stroke(); x.restore();
+      x.fillStyle = "rgba(255,221,180,0.95)"; x.font = "10px ui-sans-serif, system-ui, sans-serif";
+      x.textAlign = "center"; x.textBaseline = "middle";
+      x.fillText("stairs ↑", c.x, c.y);
+    });
+    // walls — when tidy is on, draw the raw trace faint (still draggable) and the squared
+    // result bold on top, so "before vs after" is visible; otherwise the raw walls are the bold layer.
     x.lineCap = "round";
+    const overlay = tidy && tidied.length > 0;
     walls.forEach((w) => {
       const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2);
-      x.strokeStyle = "#c7b6ff"; x.lineWidth = 5;
+      x.strokeStyle = overlay ? "rgba(199,182,255,0.28)" : "#c7b6ff";
+      x.lineWidth = overlay ? 2 : 5;
       x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
       [a, b].forEach((p) => { x.fillStyle = "#1b1640"; x.strokeStyle = "#a48bff"; x.lineWidth = 2;
         x.beginPath(); x.rect(p.x - 4, p.y - 4, 8, 8); x.fill(); x.stroke(); });
     });
+    if (overlay) {
+      tidied.forEach((w) => {
+        const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2);
+        x.strokeStyle = "#c7b6ff"; x.lineWidth = 5;
+        x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
+      });
+    }
     // draft wall
     if (drag.current?.type === "newwall") {
       const a = toScreen(drag.current.x1, drag.current.y1), b = toScreen(drag.current.x2, drag.current.y2);
@@ -307,6 +476,17 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
       x.beginPath(); x.arc(p.x, p.y, 6, 0, Math.PI * 2); x.fill();
       x.strokeStyle = "rgba(0,0,0,0.4)"; x.lineWidth = 1.5; x.stroke();
     });
+    // room name labels (on top), with a soft pill behind for legibility
+    rooms.forEach((r) => {
+      if (!r.name) return;
+      const c = toScreen(r.x, r.y);
+      x.font = "600 12px ui-sans-serif, system-ui, sans-serif";
+      x.textAlign = "center"; x.textBaseline = "middle";
+      const tw = x.measureText(r.name).width;
+      x.fillStyle = "rgba(12,10,31,0.55)";
+      x.beginPath(); x.rect(c.x - tw / 2 - 6, c.y - 10, tw + 12, 20); x.fill();
+      x.fillStyle = "#ece9f5"; x.fillText(r.name, c.x, c.y);
+    });
     // scale draft
     const sd = scaleDraft;
     if (sd) {
@@ -315,9 +495,31 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
       x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke(); x.setLineDash([]);
       [a, b].forEach((p) => { x.fillStyle = "#fbbf24"; x.beginPath(); x.arc(p.x, p.y, 4, 0, 7); x.fill(); });
     }
-  }, [img, size, walls, openings, scaleDraft, showImg, recompute]);
+    // selection highlight + corner resize handles
+    if (selected) {
+      const b = boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
+      if (b) {
+        const o = b.o, c = toScreen(o.x, o.y), w = o.w * tf.current.s, h = o.h * tf.current.s;
+        x.save(); x.translate(c.x, c.y); x.rotate((o.deg || 0) * Math.PI / 180);
+        x.strokeStyle = "#7CFFCB"; x.lineWidth = 2; x.setLineDash([5, 3]);
+        x.strokeRect(-w / 2, -h / 2, w, h); x.setLineDash([]); x.restore();
+        boxCorners(o).forEach((cn) => { const p = toScreen(cn.x, cn.y); x.fillStyle = "#7CFFCB"; x.strokeStyle = "#0c0a1f"; x.lineWidth = 1.5; x.beginPath(); x.rect(p.x - 5, p.y - 5, 10, 10); x.fill(); x.stroke(); });
+      }
+    }
+  }, [img, size, walls, tidied, tidy, openings, furniture, stairs, rooms, selected, scale, scaleDraft, showImg, recompute]);
 
   useEffect(() => { draw(); }, [draw]);
+
+  // delete the selected box with the keyboard (desktop), ignoring text fields
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!selected) return;
+      if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+      if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); delBox(selected.kind, selected.id); setSelected(null); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- pointer interaction ----
   const getXY = (e) => {
@@ -333,18 +535,40 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
     return best;
   };
 
+  // snap a coordinate to the foot grid when drawing on the blank "Draw a new plan" canvas
+  const snapGrid = (v) => (img?.blank && scale ? Math.round(v / scale.pixelsPerUnit) * scale.pixelsPerUnit : v);
+
+  // furniture + stairs as one selectable "box" list (stairs drawn first, so furniture is on top)
+  const boxList = () => [...furniture.map((o) => ({ kind: "furn", o })), ...stairs.map((o) => ({ kind: "stair", o }))];
+  const setBox = (kind, id, patch) => (kind === "furn"
+    ? setFurniture((a) => a.map((o) => (o.id === id ? { ...o, ...patch } : o)))
+    : setStairs((a) => a.map((o) => (o.id === id ? { ...o, ...patch } : o))));
+  const delBox = (kind, id) => (kind === "furn"
+    ? setFurniture((a) => a.filter((o) => o.id !== id))
+    : setStairs((a) => a.filter((o) => o.id !== id)));
+  // hit-test boxes: a resize handle of the selected box wins, else the topmost body under the point
+  const hitBox = (px, py, sx, sy) => {
+    const list = boxList();
+    if (selected) {
+      const f = list.find((b) => b.kind === selected.kind && b.o.id === selected.id);
+      if (f) for (const cn of boxCorners(f.o)) { const p = toScreen(cn.x, cn.y); if (Math.hypot(p.x - sx, p.y - sy) < 11) return { ...f, corner: cn }; }
+    }
+    for (let i = list.length - 1; i >= 0; i--) if (boxInside(px, py, list[i].o)) return list[i];
+    return null;
+  };
+
   const onDown = (e) => {
     e.preventDefault();
     const { sx, sy, x, y } = getXY(e);
     const hitR = 10 / tf.current.s;
 
     if (tool === "scale") { setScaleDraft({ x1: x, y1: y, x2: x, y2: y }); drag.current = { type: "scale" }; return; }
-    if (tool === "wall") { drag.current = { type: "newwall", x1: x, y1: y, x2: x, y2: y }; return; }
+    if (tool === "wall") { const gx = snapGrid(x), gy = snapGrid(y); drag.current = { type: "newwall", x1: gx, y1: gy, x2: gx, y2: gy }; return; }
     if (tool === "door" || tool === "window") {
       const nw = nearestWall(x, y);
       if (nw && nw.dist < 40 / tf.current.s) {
         const um = scale ? (scale.unit === "ft" ? FT_TO_M : 1) : 1;
-        const defW = scale ? ((tool === "door" ? 0.9 : 1.2) / um) * scale.pixelsPerUnit : 36;
+        const defW = scale ? ((tool === "door" ? DOOR_W_M : WIN_W_M) / um) * scale.pixelsPerUnit : 36;
         setOpenings((o) => [...o, { id: nid(), x: nw.cx, y: nw.cy, w: defW, type: tool }]);
       }
       return;
@@ -353,11 +577,21 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
       // opening first
       const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 10; });
       if (oh) { setOpenings((o) => o.filter((q) => q.id !== oh.id)); return; }
+      const bb = hitBox(x, y, sx, sy); // furniture / stairs
+      if (bb) { delBox(bb.kind, bb.o.id); if (selected?.id === bb.o.id) setSelected(null); return; }
       const nw = nearestWall(x, y);
       if (nw && nw.dist < hitR * 1.5) setWalls((w) => w.filter((q) => q.id !== nw.w.id));
       return;
     }
-    // move: grab an endpoint
+    // move tool — priority: resize handle of selection → wall endpoint → opening → box body (select+move)
+    const bh = hitBox(x, y, sx, sy);
+    if (bh?.corner) {
+      const o = bh.o, d = ((o.deg || 0) * Math.PI) / 180, c = Math.cos(d), s = Math.sin(d), hw = o.w / 2, hh = o.h / 2;
+      const ox = -bh.corner.sx, oy = -bh.corner.sy; // opposite (fixed) corner
+      const fixx = o.x + ox * hw * c - oy * hh * s, fixy = o.y + ox * hw * s + oy * hh * c;
+      drag.current = { type: "boxresize", kind: bh.kind, id: o.id, fixx, fixy, ux: [c, s], uy: [-s, c] };
+      return;
+    }
     for (const w of walls) {
       for (const end of [1, 2]) {
         const ex = end === 1 ? w.x1 : w.x2, ey = end === 1 ? w.y1 : w.y2;
@@ -365,9 +599,10 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
         if (Math.hypot(p.x - sx, p.y - sy) < 9) { drag.current = { type: "endpoint", id: w.id, end }; return; }
       }
     }
-    // grab an opening to slide
     const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 9; });
-    if (oh) drag.current = { type: "opening", id: oh.id };
+    if (oh) { drag.current = { type: "opening", id: oh.id }; return; }
+    if (bh) { setSelected({ kind: bh.kind, id: bh.o.id }); drag.current = { type: "boxmove", kind: bh.kind, id: bh.o.id, gx: bh.o.x - x, gy: bh.o.y - y }; return; }
+    setSelected(null);
   };
 
   const onMove = (e) => {
@@ -377,12 +612,19 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
     if (d.type === "endpoint") {
       setWalls((ws) => ws.map((w) => w.id === d.id ? (d.end === 1 ? { ...w, x1: x, y1: y } : { ...w, x2: x, y2: y }) : w));
     } else if (d.type === "newwall") {
-      drag.current = { ...d, x2: x, y2: y }; draw();
+      drag.current = { ...d, x2: snapGrid(x), y2: snapGrid(y) }; draw();
     } else if (d.type === "scale") {
       setScaleDraft((s) => s && { ...s, x2: x, y2: y });
     } else if (d.type === "opening") {
       const nw = nearestWall(x, y);
       setOpenings((o) => o.map((q) => q.id === d.id ? { ...q, x: nw ? nw.cx : x, y: nw ? nw.cy : y } : q));
+    } else if (d.type === "boxmove") {
+      setBox(d.kind, d.id, { x: x + d.gx, y: y + d.gy });
+    } else if (d.type === "boxresize") {
+      const Vx = x - d.fixx, Vy = y - d.fixy;                       // diagonal from the fixed corner to the pointer
+      const w = Math.max(6, Math.abs(Vx * d.ux[0] + Vy * d.ux[1])); // project onto the box's own axes
+      const h = Math.max(6, Math.abs(Vx * d.uy[0] + Vy * d.uy[1]));
+      setBox(d.kind, d.id, { x: (d.fixx + x) / 2, y: (d.fixy + y) / 2, w, h });
     }
   };
 
@@ -400,8 +642,22 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
   };
 
   const applyScale = () => {
-    const px = scaleInput._px, len = parseFloat(scaleInput.len);
-    if (px && len > 0) { setScale({ pixelsPerUnit: px / len, unit: scaleInput.unit }); setScaleDraft(null); setScaleInput({ len: "", unit: scaleInput.unit }); setTool("move"); }
+    const px = scaleInput._px;
+    if (!px) return;
+    let pixelsPerUnit = null, unit = "ft";
+    if (scaleMode === "grid") {
+      const sq = parseFloat(scaleInput.squares), fps = parseFloat(scaleInput.ftPerSq) || 1;
+      if (sq > 0) pixelsPerUnit = px / (sq * fps); // px per foot
+    } else {
+      const len = parseFloat(scaleInput.len);
+      if (len > 0) { pixelsPerUnit = px / len; unit = scaleInput.unit; }
+    }
+    if (pixelsPerUnit) {
+      setScale({ pixelsPerUnit, unit });
+      setScaleDraft(null);
+      setScaleInput((s) => ({ len: "", unit, squares: "", ftPerSq: s.ftPerSq }));
+      setTool("move");
+    }
   };
 
   // derived: building size if scale set
@@ -409,8 +665,12 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
   if (scale && walls.length) {
     let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
     walls.forEach((w) => { minx = Math.min(minx, w.x1, w.x2); maxx = Math.max(maxx, w.x1, w.x2); miny = Math.min(miny, w.y1, w.y2); maxy = Math.max(maxy, w.y1, w.y2); });
-    const u = (v) => (v / scale.pixelsPerUnit).toFixed(1);
-    dims = `${u(maxx - minx)} × ${u(maxy - miny)} ${scale.unit}`;
+    // always report in feet-and-inches, converting from meters if the scale was set in m
+    const toFeet = (vpx) => {
+      const inUnit = vpx / scale.pixelsPerUnit;
+      return scale.unit === "ft" ? inUnit : inUnit / FT_TO_M;
+    };
+    dims = `${ftIn(toFeet(maxx - minx))} × ${ftIn(toFeet(maxy - miny))}`;
   }
 
   const tools = [["move", "Move"], ["wall", "Add wall"], ["door", "Door"], ["window", "Window"], ["scale", "Set scale"], ["erase", "Erase"]];
@@ -420,13 +680,16 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
       {error && <div className="mb-3 text-sm rounded-lg px-3 py-2" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#fde68a" }}>{error}</div>}
       <div className="flex flex-wrap items-center gap-2 mb-3">
         {tools.map(([k, label]) => (
-          <button key={k} onClick={() => { setTool(k); if (k === "scale") setScaleDraft(null); }}
+          <button key={k} onClick={() => { setTool(k); setSelected(null); if (k === "scale") setScaleDraft(null); }}
             className="px-3 py-1.5 rounded-lg text-sm"
             style={{ background: tool === k ? "#6d5ae6" : "rgba(255,255,255,0.06)", border: "1px solid " + (tool === k ? "#8b78ff" : "rgba(255,255,255,0.12)"), color: tool === k ? "#fff" : "#cbd5e1" }}>
             {label}
           </button>
         ))}
         <div className="flex-1" />
+        <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
+          <input type="checkbox" checked={tidy} onChange={(e) => setTidy?.(e.target.checked)} /> tidy up the drawing
+        </label>
         <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
           <input type="checkbox" checked={showImg} onChange={(e) => setShowImg(e.target.checked)} /> show drawing
         </label>
@@ -439,25 +702,78 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
           style={{ display: "block", cursor: tool === "move" ? "grab" : "crosshair" }} />
       </div>
 
+      {/* selected-furniture control bar */}
+      {(() => {
+        const sel = selected && boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
+        if (!sel) return null;
+        const isFurn = sel.kind === "furn";
+        return (
+          <div className="mt-3 rounded-lg px-3 py-2.5 flex flex-wrap items-center gap-3 text-sm" style={{ background: "rgba(124,255,203,0.08)", border: "1px solid rgba(124,255,203,0.3)" }}>
+            <span style={{ color: "#7CFFCB" }}>{isFurn ? "Furniture" : "Staircase"} selected</span>
+            {isFurn && (
+              <label className="flex items-center gap-1.5 text-slate-300">this is a
+                <select value={sel.o.type} onChange={(e) => setBox("furn", sel.o.id, { type: e.target.value })}
+                  className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
+                  {FURN_TYPE_LIST.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}
+                </select>
+              </label>
+            )}
+            <span className="text-slate-400 text-xs">drag the box to move · drag a corner to resize</span>
+            <button onClick={() => { delBox(sel.kind, sel.o.id); setSelected(null); }}
+              className="ml-auto px-3 py-1 rounded text-white text-xs font-medium" style={{ background: "#b4444e" }}>Delete</button>
+          </div>
+        );
+      })()}
+
       {/* scale input panel */}
       {tool === "scale" && (
-        <div className="mt-3 rounded-lg px-3 py-3 flex flex-wrap items-center gap-3 text-sm" style={{ background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.3)" }}>
-          <span className="text-amber-200">Drag a line along a wall of known length, then enter how long it really is:</span>
-          <input type="number" placeholder="length" value={scaleInput.len}
-            onChange={(e) => setScaleInput((s) => ({ ...s, len: e.target.value }))}
-            className="w-24 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
-          <select value={scaleInput.unit} onChange={(e) => setScaleInput((s) => ({ ...s, unit: e.target.value }))}
-            className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
-            <option value="ft">feet</option><option value="m">meters</option>
-          </select>
-          <button onClick={applyScale} disabled={!scaleInput._px || !scaleInput.len}
-            className="px-3 py-1 rounded text-white" style={{ background: scaleInput._px && scaleInput.len ? "#d97706" : "rgba(255,255,255,0.1)" }}>Set</button>
+        <div className="mt-3 rounded-lg px-3 py-3 text-sm" style={{ background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.3)" }}>
+          <div className="flex flex-wrap items-center gap-2 mb-2">
+            <span className="text-amber-200 mr-1">How do you want to set the real size?</span>
+            {[["grid", "On grid paper"], ["wall", "I know a wall's length"]].map(([k, label]) => (
+              <button key={k} onClick={() => setScaleMode(k)} className="px-2.5 py-1 rounded text-xs"
+                style={{ background: scaleMode === k ? "#d97706" : "rgba(255,255,255,0.06)", border: "1px solid " + (scaleMode === k ? "#f59e0b" : "rgba(255,255,255,0.15)"), color: scaleMode === k ? "#fff" : "#fde68a" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {scaleMode === "grid" ? (
+            <div className="flex flex-wrap items-center gap-2 text-amber-100">
+              <span>Drag a line along the grid, then tell me how many squares it crossed:</span>
+              <input type="number" placeholder="squares" value={scaleInput.squares}
+                onChange={(e) => setScaleInput((s) => ({ ...s, squares: e.target.value }))}
+                className="w-24 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
+              <span className="text-amber-200/80">squares,</span>
+              <input type="number" value={scaleInput.ftPerSq}
+                onChange={(e) => setScaleInput((s) => ({ ...s, ftPerSq: e.target.value }))}
+                className="w-16 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
+              <span className="text-amber-200/80">ft per square</span>
+              <button onClick={applyScale} disabled={!scaleInput._px || !(parseFloat(scaleInput.squares) > 0)}
+                className="px-3 py-1 rounded text-white" style={{ background: scaleInput._px && parseFloat(scaleInput.squares) > 0 ? "#d97706" : "rgba(255,255,255,0.1)" }}>Set</button>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2 text-amber-100">
+              <span>Trace one wall you know the length of, then type how long it really is:</span>
+              <input type="number" placeholder="length" value={scaleInput.len}
+                onChange={(e) => setScaleInput((s) => ({ ...s, len: e.target.value }))}
+                className="w-24 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
+              <select value={scaleInput.unit} onChange={(e) => setScaleInput((s) => ({ ...s, unit: e.target.value }))}
+                className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
+                <option value="ft">feet</option><option value="m">meters</option>
+              </select>
+              <button onClick={applyScale} disabled={!scaleInput._px || !scaleInput.len}
+                className="px-3 py-1 rounded text-white" style={{ background: scaleInput._px && scaleInput.len ? "#d97706" : "rgba(255,255,255,0.1)" }}>Set</button>
+            </div>
+          )}
+          <div className="text-xs mt-2" style={{ color: scaleInput._px ? "#7CFFCB" : "rgba(253,230,138,0.6)" }}>
+            {scaleInput._px ? `✓ line measured (${Math.round(scaleInput._px)}px) — now fill in the value and press Set` : "First drag a line on the plan above."}
+          </div>
         </div>
       )}
 
       {/* status bar */}
       <div className="mt-4 flex flex-wrap items-center gap-4 text-sm">
-        <span className="text-slate-400">{walls.length} walls · {openings.filter(o => o.type === "door").length} doors · {openings.filter(o => o.type === "window").length} windows</span>
+        <span className="text-slate-400">{walls.length} walls · {openings.filter(o => o.type === "door").length} doors · {openings.filter(o => o.type === "window").length} windows · {furniture.length} furniture{stairs.length ? ` · ${stairs.length} stairs` : ""}</span>
         <span className="text-slate-400">·</span>
         {scale ? (
           <span style={{ color: "#7CFFCB" }}>Scale set{dims ? ` · footprint ≈ ${dims}` : ""}</span>
@@ -465,8 +781,8 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
           <span style={{ color: "#fbbf24" }}>No scale yet — set one for true proportions (otherwise an estimate is used)</span>
         )}
         <label className="text-slate-400 flex items-center gap-2 ml-auto">ceiling
-          <input type="range" min="2.2" max="3.6" step="0.1" value={ceiling} onChange={(e) => setCeiling(parseFloat(e.target.value))} />
-          <span className="text-slate-300 w-10">{ceiling.toFixed(1)}m</span>
+          <input type="range" min="7" max="11" step="0.5" value={ceiling} onChange={(e) => setCeiling(parseFloat(e.target.value))} />
+          <span className="text-slate-300 w-12">{ftIn(ceiling)}</span>
         </label>
       </div>
 
@@ -484,7 +800,7 @@ function Editor({ img, walls, setWalls, openings, setOpenings, scale, setScale, 
 }
 
 // ================= 3D WALK =================
-function Walk({ walls, openings, scale, ceiling, onExit }) {
+function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale, ceiling, onExit }) {
   const mountRef = useRef(null);
   const miniRef = useRef(null);
   const [locked, setLocked] = useState(false);
@@ -512,6 +828,7 @@ function Walk({ walls, openings, scale, ceiling, onExit }) {
 
     // --- build model in world meters, centered ---
     const mPerPx = (scale ? (scale.unit === "ft" ? FT_TO_M : 1) / scale.pixelsPerUnit : (12 / 1024)); // fallback ≈12m wide
+    const ceilingM = ceiling * FT_TO_M; // ceiling prop is in feet; the 3D world is in meters
     let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
     walls.forEach((w) => { minx = Math.min(minx, w.x1, w.x2); maxx = Math.max(maxx, w.x1, w.x2); miny = Math.min(miny, w.y1, w.y2); maxy = Math.max(maxy, w.y1, w.y2); });
     const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
@@ -548,7 +865,7 @@ function Walk({ walls, openings, scale, ceiling, onExit }) {
       const solid = (s, e) => {
         if (e - s < 0.03) return;
         const [sx, sz] = at(s), [ex, ez] = at(e);
-        box(sx, sz, ex, ez, 0, ceiling, WALL_T_M, wallMat);
+        box(sx, sz, ex, ez, 0, ceilingM, WALL_T_M, wallMat);
         collide.push({ ax: sx, az: sz, bx: ex, bz: ez, ht: WALL_T_M / 2 + 0.02 });
       };
       ops.forEach((op) => {
@@ -556,11 +873,11 @@ function Walk({ walls, openings, scale, ceiling, onExit }) {
         const [sx, sz] = at(op.s), [ex, ez] = at(op.e);
         if (op.type === "window") {
           box(sx, sz, ex, ez, 0, WIN_SILL_M, WALL_T_M, wallMat);        // sill
-          box(sx, sz, ex, ez, WIN_TOP_M, ceiling, WALL_T_M, wallMat); // header
+          box(sx, sz, ex, ez, WIN_TOP_M, ceilingM, WALL_T_M, wallMat); // header
           box(sx, sz, ex, ez, WIN_SILL_M, WIN_TOP_M, WALL_T_M * 0.4, glassMat);
           collide.push({ ax: sx, az: sz, bx: ex, bz: ez, ht: WALL_T_M / 2 + 0.02 }); // can't walk through glass
         } else {
-          box(sx, sz, ex, ez, DOOR_TOP_M, ceiling, WALL_T_M, wallMat); // lintel above door
+          box(sx, sz, ex, ez, DOOR_TOP_M, ceilingM, WALL_T_M, wallMat); // lintel above door
           // door span left walkable (no collision)
         }
         cur = op.e;
@@ -574,6 +891,63 @@ function Walk({ walls, openings, scale, ceiling, onExit }) {
     floor.rotation.x = -Math.PI / 2; floor.position.y = 0; scene.add(floor);
     const grid = new THREE.GridHelper(Math.max(fw, fh), Math.round(Math.max(fw, fh)), 0x4a4570, 0x35324f);
     grid.position.y = 0.01; scene.add(grid);
+
+    // --- furniture: simple blocks (visual only, walk-through) ---
+    furniture.forEach((f) => {
+      const spec = FURN_3D[f.type] || FURN_3D.other;
+      const [wx, wz] = W2(f.x, f.y);
+      const ww = Math.max(0.05, f.w * mPerPx), wd = Math.max(0.05, f.h * mPerPx);
+      const m = new THREE.Mesh(new THREE.BoxGeometry(ww, spec.h, wd),
+        new THREE.MeshStandardMaterial({ color: spec.color, roughness: 0.85 }));
+      m.position.set(wx, spec.h / 2, wz);
+      m.rotation.y = -((f.deg || 0) * Math.PI) / 180;
+      scene.add(m);
+    });
+
+    // --- staircase: stepped block + footprint collision (non-walkable) ---
+    stairs.forEach((s) => {
+      const [wx, wz] = W2(s.x, s.y);
+      const ww = Math.max(0.1, s.w * mPerPx), wd = Math.max(0.1, s.h * mPerPx);
+      const a = -((s.deg || 0) * Math.PI) / 180;
+      const grp = new THREE.Group(); grp.position.set(wx, 0, wz); grp.rotation.y = a;
+      const N = 6, topH = Math.min(ceilingM * 0.95, 1.4), depth = wd / N;
+      const stepMat = new THREE.MeshStandardMaterial({ color: 0xc8895a, roughness: 0.9 });
+      for (let i = 0; i < N; i++) {
+        const h = (topH * (i + 1)) / N;
+        const m = new THREE.Mesh(new THREE.BoxGeometry(ww, h, depth), stepMat);
+        m.position.set(0, h / 2, -wd / 2 + depth * (i + 0.5));
+        grp.add(m);
+      }
+      scene.add(grp);
+      const co = Math.cos(a), si = Math.sin(a), hw = ww / 2, hd = wd / 2;
+      const corner = (lx, lz) => [wx + lx * co + lz * si, wz - lx * si + lz * co]; // Three.js Y-rotation
+      const c1 = corner(-hw, -hd), c2 = corner(hw, -hd), c3 = corner(hw, hd), c4 = corner(-hw, hd);
+      [[c1, c2], [c2, c3], [c3, c4], [c4, c1]].forEach(([p, q]) =>
+        collide.push({ ax: p[0], az: p[1], bx: q[0], bz: q[1], ht: WALL_T_M / 2 + 0.02 }));
+    });
+
+    // --- floating room-name labels (always visible, for orientation) ---
+    function makeLabel(text) {
+      const fontPx = 48, pad = 22;
+      const c = document.createElement("canvas");
+      let ctx = c.getContext("2d");
+      ctx.font = `600 ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+      c.width = Math.ceil(ctx.measureText(text).width) + pad * 2; c.height = fontPx + pad * 2;
+      ctx = c.getContext("2d");
+      ctx.font = `600 ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+      ctx.fillStyle = "rgba(12,10,31,0.6)"; ctx.fillRect(0, 0, c.width, c.height);
+      ctx.fillStyle = "#ece9f5"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(text, c.width / 2, c.height / 2);
+      const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4;
+      const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.9, depthTest: false }));
+      spr.scale.set(c.width * 0.0028, c.height * 0.0028, 1); spr.renderOrder = 10;
+      return spr;
+    }
+    rooms.forEach((r) => {
+      if (!r.name) return;
+      const [wx, wz] = W2(r.x, r.y);
+      const spr = makeLabel(r.name); spr.position.set(wx, 1.85, wz); scene.add(spr);
+    });
 
     // (camera spawn is set after the collision resolver is defined)
 
@@ -708,7 +1082,7 @@ function Walk({ walls, openings, scale, ceiling, onExit }) {
       renderer.dispose();
       mount.removeChild(renderer.domElement);
     };
-  }, [walls, openings, scale, ceiling]);
+  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]);
 
   // ---- touch joystick (left) ----
   const jBase = useRef(null);

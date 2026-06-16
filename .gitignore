@@ -11,6 +11,10 @@ dist-ssr
 # netlify
 .netlify
 
+# local-only test fixtures (e.g. personal hand-drawn plans) — never commit
+public/_*
+.testdata/
+
 # os / editor
 .DS_Store
 *.log
