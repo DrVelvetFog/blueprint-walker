@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# secrets — the Anthropic key lives only here for local dev, never committed
+.env
+.env.*
+!.env.example
+
+# netlify
+.netlify
+
+# os / editor
+.DS_Store
+*.log
