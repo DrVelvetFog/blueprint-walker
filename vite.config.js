@@ -8,8 +8,14 @@ import { VitePWA } from "vite-plugin-pwa";
 //
 // No server code: tracing calls Anthropic straight from the browser with the
 // user's own key (src/vision.js), so there are no secrets to load here.
+// Share cards need an absolute image URL. Netlify sets URL during its build; locally it's
+// empty and the image path stays relative. Keeps the live address out of the repo.
+const siteUrl = (process.env.URL || "").replace(/\/$/, "");
+const siteUrlInHtml = { name: "site-url-in-html", transformIndexHtml: (html) => html.replaceAll("%SITE_URL%", siteUrl) };
+
 export default defineConfig({
   plugins: [
+    siteUrlInHtml,
     react(),
     tailwindcss(),
     // Installable PWA: add-to-home-screen with an icon + name. Service worker

@@ -474,28 +474,54 @@ function Dialog({ title, body, input, confirmLabel = "OK", cancelLabel = "Cancel
 // ---------- first-open tutorial ----------
 function Welcome({ onClose }) {
   const steps = [
-    ["📷", "Add your plan", "Snap a photo of a floor plan — a sketch on paper is perfect — or start a blank grid and draw one."],
-    ["✨", "We trace it", "Claude finds the walls, doors, windows, and furniture, using your own Anthropic key. No key? Trace it by hand over your photo."],
-    ["✏️", "Fix it up", "Tap any piece to move, resize, or delete it. Pinch to zoom in for the small stuff."],
-    ["🚶", "Walk it", "Step inside and walk around your space in 3D."],
+    ["📷", "Add your plan", "Snap a photo of a floor plan (a sketch on paper is perfect), open a plan file, or start a blank grid and draw one."],
+    ["✨", "Trace it", "Claude finds the walls, doors, windows, and furniture, using your own Anthropic key. No key? Trace it by hand over your photo."],
+    ["✏️", "Fix it up", "Tap any piece to move, resize, rename or delete it. Set the real size so lengths are right."],
+    ["🚶", "Walk it", "Step inside and walk around, or see the whole place from above in Dollhouse view."],
   ];
+  const tools = [
+    ["Add wall", "drag from corner to corner; ends snap together"],
+    ["Door / Window", "tap on a wall"],
+    ["Add item", "pick furniture or stairs, then tap where it goes"],
+    ["Room name", "tap where a room's name should go"],
+    ["Set real size", "tell us one real length, or how big the grid squares are"],
+    ["Share & download", "a link, a picture, or a plan file to open anywhere"],
+  ];
+  const okRef = useRef(null);
+  useEffect(() => {
+    okRef.current?.focus();
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-5" style={{ background: "rgba(8,6,20,0.72)" }} onClick={onClose}>
-      <div className="w-full max-w-md rounded-2xl p-6" style={{ background: "#15122e", border: "1px solid rgba(255,255,255,0.12)" }} onClick={(e) => e.stopPropagation()}>
-        <h2 className="text-xl font-semibold mb-1" style={{ color: "#c7b6ff" }}>Welcome 👋</h2>
-        <p className="text-slate-400 text-sm mb-5">Turn a floor plan into a space you can walk through — in four steps:</p>
-        <div className="flex flex-col gap-3.5 mb-6">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(8,6,20,0.72)" }} onClick={onClose}>
+      <div role="dialog" aria-modal="true" aria-labelledby="bw-help-title" className="w-full max-w-md rounded-2xl p-6 overflow-y-auto" style={{ maxHeight: "calc(100dvh - 2rem)", background: "#15122e", border: "1px solid rgba(255,255,255,0.12)" }} onClick={(e) => e.stopPropagation()}>
+        <h2 id="bw-help-title" className="text-xl font-semibold mb-1" style={{ color: "#c7b6ff" }}>Welcome 👋</h2>
+        <p className="text-slate-300 text-sm mb-5">Turn a floor plan into a space you can walk through, in four steps:</p>
+        <ol className="flex flex-col gap-3.5 mb-5">
           {steps.map(([icon, title, body], i) => (
-            <div key={i} className="flex gap-3">
-              <div className="text-xl leading-none mt-0.5">{icon}</div>
+            <li key={i} className="flex gap-3">
+              <div className="text-xl leading-none mt-0.5" aria-hidden="true">{icon}</div>
               <div>
                 <div className="text-slate-100 font-medium text-sm">{i + 1}. {title}</div>
-                <div className="text-slate-400 text-xs leading-relaxed">{body}</div>
+                <div className="text-slate-300 text-xs leading-relaxed">{body}</div>
               </div>
-            </div>
+            </li>
           ))}
-        </div>
-        <button onClick={onClose} className="w-full py-2.5 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Get started</button>
+        </ol>
+        <h3 className="text-sm font-medium text-slate-100 mb-1.5">In the editor</h3>
+        <ul className="mb-5 text-xs text-slate-300 leading-relaxed">
+          {tools.map(([k, v]) => <li key={k}><b className="text-slate-100 font-medium">{k}</b>: {v}</li>)}
+        </ul>
+        <h3 className="text-sm font-medium text-slate-100 mb-1.5">Your privacy</h3>
+        <ul className="mb-6 text-xs text-slate-300 leading-relaxed list-disc pl-4">
+          <li>A photo you trace goes straight from your device to Anthropic (the makers of Claude), on your own key. It never touches our server.</li>
+          <li>Your key stays on this device, and only for this visit unless you tick “Remember”.</li>
+          <li>Plans you save stay in this browser. Share links carry the layout, never your photo.</li>
+          <li>Drawing by hand, the sample, and the 3D walk use no AI and send nothing anywhere.</li>
+        </ul>
+        <button ref={okRef} onClick={onClose} className="w-full min-h-11 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Get started</button>
       </div>
     </div>
   );
@@ -523,7 +549,7 @@ function Header({ stage, onHelp }) {
                 style={{ background: i <= idx ? "rgba(124,99,255,0.25)" : "transparent", border: "1px solid " + (i <= idx ? "rgba(124,99,255,0.5)" : "rgba(255,255,255,0.08)") }}>
                 {i + 1}. {label}
               </span>
-              {i < steps.length - 1 && <span className="text-slate-500 text-xs" aria-hidden="true">→</span>}
+              {i < steps.length - 1 && <span className="text-slate-400 text-xs" aria-hidden="true">→</span>}
             </li>
           ))}
         </ol>
@@ -564,7 +590,7 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
               <button onClick={onSample} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Try a sample</button>
               <button onClick={() => planFileRef.current?.click()} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Open a plan file</button>
             </div>
-            <div className="text-slate-500 text-xs mt-4">“Draw a new plan” gives you a blank grid where 1 square = 1 foot — no photo needed.</div>
+            <div className="text-slate-400 text-xs mt-4">“Draw a new plan” gives you a blank grid where 1 square = 1 foot — no photo needed.</div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
             <input ref={planFileRef} type="file" accept=".json,application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onOpenFile?.(f); }} />
             <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
@@ -581,7 +607,7 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
                     <div className="px-2.5 py-2 flex flex-col gap-2">
                       <div className="min-w-0">
                         <div className="text-sm text-slate-100 truncate">{p.name}</div>
-                        <div className="text-[11px] text-slate-500">{new Date(p.savedAt).toLocaleDateString()}{p.photoDropped ? " · no photo" : ""}</div>
+                        <div className="text-[11px] text-slate-400">{new Date(p.savedAt).toLocaleDateString()}{p.photoDropped ? " · no photo" : ""}</div>
                       </div>
                       <div className="flex flex-wrap items-center gap-1.5">
                         <button onClick={() => onOpenPlan?.(p, false)} className="flex-1 min-h-9 pointer-coarse:min-h-11 px-2 py-1 rounded text-xs font-medium text-white" style={{ background: "#6d5ae6" }}>Open</button>
@@ -695,10 +721,10 @@ function KeyBox({ onChange }) {
 
 function Analyzing() {
   return (
-    <div className="max-w-xl mx-auto px-5 py-24 text-center">
-      <div className="inline-block w-10 h-10 rounded-full mb-5 animate-spin" style={{ border: "3px solid rgba(124,99,255,0.25)", borderTopColor: "#a48bff" }} />
+    <div role="status" aria-live="polite" className="max-w-xl mx-auto px-5 py-24 text-center">
+      <div aria-hidden="true" className="inline-block w-10 h-10 rounded-full mb-5 motion-safe:animate-spin" style={{ border: "3px solid rgba(124,99,255,0.25)", borderTopColor: "#a48bff" }} />
       <p className="text-slate-300">Reading your plan…</p>
-      <p className="text-slate-500 text-xs mt-2">Finding the walls, doors, and windows — you'll get to fix anything next.</p>
+      <p className="text-slate-400 text-xs mt-2">Finding the walls, doors, and windows — you'll get to fix anything next.</p>
     </div>
   );
 }
