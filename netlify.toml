@@ -1,17 +1,26 @@
-# netlify.toml  — place at the repo root
+# netlify.toml
 [build]
   command = "npm run build"
   publish = "dist"            # Vite's output folder
 
-[functions]
-  directory = "netlify/functions"
-  node_bundler = "esbuild"
-
 # SPA fallback: send any unknown path to index.html so deep links don't 404.
-# Functions at /.netlify/functions/* are served natively by Netlify before this
-# catch-all is applied, so the function path passes through untouched — no
-# explicit redirect for it is needed (and one would be rejected as invalid).
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
+
+# Security headers. The user's Anthropic key lives in this page, so the page may
+# only load its own files and may only connect to itself and Anthropic's API.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://api.anthropic.com; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "microphone=(), geolocation=()"
+
+# Hashed build files never change, so browsers can keep them for a year.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import * as THREE from "three";
+import { traceWithClaude, TRACE_ERRORS, getKey, saveKey, forgetKey, keyIsRemembered, looksLikeKey } from "./vision.js";
 
 /*  Blueprint → Walkable 3D  ·  end-to-end pipeline prototype
     Stages: upload → analyze (Claude vision) → calibrate + correct (2D editor) → walk (Three.js FPS)
@@ -148,6 +149,7 @@ export default function FloorPlanWalker() {
   const [ceiling, setCeiling] = useState(CEILING_FT_DEFAULT); // stored in feet; converted to meters in the 3D walk
   const [tidy, setTidy] = useState(true);        // "Tidy up the drawing": square the trace for display + build
   const [error, setError] = useState(null);
+  const [errorRetry, setErrorRetry] = useState(false); // show "Try again" with the error
   const [savedPlans, setSavedPlans] = useState(loadPlans); // localStorage-backed "My plans"
   const [currentPlanId, setCurrentPlanId] = useState(null); // the saved entry we're editing, so Save overwrites it
   const [currentName, setCurrentName] = useState("");       // its name (prefilled into the Save box)
@@ -212,22 +214,17 @@ export default function FloorPlanWalker() {
     reader.readAsDataURL(file);
   }, []);
 
-  // ---- vision extraction via the key-safe server function ----
-  // The browser only ever POSTs the image to our own /.netlify/functions/extract-plan.
-  // That function (server-side) does the actual vision call and returns the plan JSON
-  // contract: { w, d, win, scale, rooms }. The Anthropic key stays server-side, never in the client.
+  // ---- vision extraction with the user's own Anthropic key ----
+  // The browser calls Anthropic directly (src/vision.js). No server in the path, and each
+  // trace is billed to the user's key. Returns the plan JSON contract { w, d, win, furn, stairs, scale, rooms }.
   const analyze = useCallback(async () => {
-    if (!img) return;
-    setStage("analyzing"); setError(null);
+    if (!img?.url) return;                     // samples and drawn plans have no photo to trace
+    const apiKey = getKey();
+    if (!apiKey) { setError(TRACE_ERRORS.nokey.msg); setErrorRetry(false); return; }
+    setStage("analyzing"); setError(null); setErrorRetry(false);
     const base64 = img.url.split(",")[1];
     try {
-      const res = await fetch("/.netlify/functions/extract-plan", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ imageBase64: base64, mediaType: "image/jpeg", width: img.w, height: img.h }),
-      });
-      const p = await res.json();              // -> { w, d, win, furn, stairs, scale, rooms } | { error }
-      if (!res.ok || p.error) throw new Error(p.error || ("server " + res.status));
+      const p = await traceWithClaude({ apiKey, base64, width: img.w, height: img.h });
       // walls: 5th element (conf 0–1) is optional/additive — older 4-element responses default to confident
       const nw = (p.w || []).filter(a => Array.isArray(a) && a.length >= 4)
         .map(a => ({ id: nid(), x1: a[0], y1: a[1], x2: a[2], y2: a[3], conf: (a.length >= 5 && isFinite(a[4])) ? Math.max(0, Math.min(1, a[4])) : 1 }));
@@ -246,10 +243,14 @@ export default function FloorPlanWalker() {
       if (p.scale && p.scale.px && p.scale.len) {
         setScale({ pixelsPerUnit: p.scale.px / p.scale.len, unit: p.scale.unit === "m" ? "m" : "ft" });
       }
+      if (!nw.length) { setError(TRACE_ERRORS.unreadable.msg); setErrorRetry(true); }
       setStage("editor");
     } catch (err) {
-      setError("That photo was a little hard to read — try again in good light, or just draw the walls yourself with the tools below.");
-      setStage("editor");
+      const code = TRACE_ERRORS[err?.code] ? err.code : "unreadable";
+      setError(TRACE_ERRORS[code].msg); setErrorRetry(TRACE_ERRORS[code].retry);
+      // Key and account problems get fixed on the photo screen; anything else lands in the
+      // editor with the photo underneath, so the walls can still be traced by hand.
+      setStage(["nokey", "badkey", "nocredit", "permission"].includes(code) ? "upload" : "editor");
     }
   }, [img]);
 
@@ -385,7 +386,11 @@ export default function FloorPlanWalker() {
         {showIntro && <Welcome onClose={closeIntro} />}
         <Header stage={stage} onHelp={() => setShowIntro(true)} />
         {stage === "upload" && (
-          <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank} onReset={() => setImg(null)}
+          <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank}
+            onReset={() => { setImg(null); setError(null); }}
+            onSkip={() => { setError(null); setStage("editor"); }}
+            onKeyChange={() => setError(null)}
+            error={error}
             savedPlans={savedPlans} onOpenPlan={openPlan} onRenamePlan={renamePlan} onDeletePlan={deletePlan} />
         )}
         {stage === "analyzing" && <Analyzing />}
@@ -398,11 +403,11 @@ export default function FloorPlanWalker() {
             rooms={rooms} setRooms={setRooms}
             scale={scale} setScale={setScale}
             ceiling={ceiling} setCeiling={setCeiling}
-            error={error} onRotate={rotatePlan}
+            error={error} onRetry={errorRetry && img?.url ? analyze : null} onRotate={rotatePlan}
             savedName={currentName} onSave={savePlan} saveStatus={saveStatus}
             onUndo={undo} canUndo={canUndo} onPushHistory={pushHistory}
             onWalk={() => setStage("walk")}
-            onBack={() => { setStage("upload"); }}
+            onBack={() => { setError(null); setStage("upload"); }}
           />
         )}
         {stage === "walk" && (
@@ -417,7 +422,7 @@ export default function FloorPlanWalker() {
 function Welcome({ onClose }) {
   const steps = [
     ["📷", "Add your plan", "Snap a photo of a floor plan — a sketch on paper is perfect — or start a blank grid and draw one."],
-    ["✨", "We trace it", "We find the walls, doors, windows, and furniture for you."],
+    ["✨", "We trace it", "Claude finds the walls, doors, windows, and furniture, using your own Anthropic key. No key? Trace it by hand over your photo."],
     ["✏️", "Fix it up", "Tap any piece to move, resize, or delete it. Pinch to zoom in for the small stuff."],
     ["🚶", "Walk it", "Step inside and walk around your space in 3D."],
   ];
@@ -473,9 +478,10 @@ function Header({ stage, onHelp }) {
 }
 
 // ---------- upload ----------
-function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
+function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, onKeyChange, error, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
   const fileRef = useRef(null), camRef = useRef(null);
   const [drag, setDrag] = useState(false);
+  const [hasKey, setHasKey] = useState(() => !!getKey());
   const drop = (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); };
 
   return (
@@ -531,14 +537,95 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, savedPlans
         </>
       ) : (
         <div className="text-center">
-          <h2 className="text-lg font-medium mb-4">Looks good — ready when you are.</h2>
-          <div className="inline-block rounded-xl overflow-hidden mb-5" style={{ border: "1px solid rgba(255,255,255,0.12)", maxWidth: "100%" }}>
-            {img.url ? <img src={img.url} alt="floor plan" style={{ maxHeight: 420, display: "block" }} /> : <div className="px-16 py-12 text-slate-400">sample plan loaded</div>}
+          {img.url ? (
+            <>
+              <h2 className="text-lg font-medium mb-4">Looks good — ready when you are.</h2>
+              <div className="inline-block rounded-xl overflow-hidden mb-5" style={{ border: "1px solid rgba(255,255,255,0.12)", maxWidth: "100%" }}>
+                <img src={img.url} alt="floor plan" style={{ maxHeight: 360, maxWidth: "100%", display: "block" }} />
+              </div>
+              {error && <div role="alert" className="max-w-xl mx-auto mb-4 text-sm rounded-lg px-3 py-2 text-left" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#fde68a" }}>{error}</div>}
+              <KeyBox onChange={(v) => { setHasKey(v); onKeyChange?.(); }} />
+              <div className="flex flex-wrap gap-3 justify-center mt-5">
+                <button onClick={onAnalyze} disabled={!hasKey} className="px-5 py-2.5 rounded-lg text-sm font-semibold text-white disabled:opacity-40 disabled:cursor-not-allowed" style={{ background: "#6d5ae6" }}>Trace my plan →</button>
+                <button onClick={onSkip} className="px-4 py-2.5 rounded-lg text-sm text-white" style={{ background: "rgba(124,255,203,0.14)", border: "1px solid rgba(124,255,203,0.4)" }}>Trace it by hand</button>
+                <button onClick={onReset} className="px-4 py-2.5 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Use a different image</button>
+              </div>
+              <p className="text-slate-400 text-xs mt-3">“Trace it by hand” puts your photo under the grid so you can draw the walls over it. No key needed.</p>
+            </>
+          ) : (
+            <>
+              <h2 className="text-lg font-medium mb-4">You have a plan open.</h2>
+              <div className="flex flex-wrap gap-3 justify-center">
+                <button onClick={onSkip} className="px-5 py-2.5 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Keep editing →</button>
+                <button onClick={onReset} className="px-4 py-2.5 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Start over</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- the user's own Anthropic key ----------
+// Tracing runs on the user's own Anthropic account. The key stays on this device
+// (src/vision.js) and is only ever sent to api.anthropic.com.
+function KeyBox({ onChange }) {
+  const [key, setKeyState] = useState(getKey);
+  const [remembered, setRemembered] = useState(keyIsRemembered);
+  const [editing, setEditing] = useState(() => !getKey());
+  const [draft, setDraft] = useState("");
+  const [remember, setRemember] = useState(false);
+  const [warn, setWarn] = useState("");
+
+  const save = () => {
+    if (!looksLikeKey(draft)) { setWarn("That doesn't look like an Anthropic API key. Keys start with “sk-ant-”."); return; }
+    saveKey(draft, remember);
+    setKeyState(draft.trim()); setRemembered(remember); setDraft(""); setWarn(""); setEditing(false);
+    onChange?.(true);
+  };
+  const forget = () => {
+    forgetKey(); setKeyState(""); setRemembered(false); setEditing(true);
+    onChange?.(false);
+  };
+
+  return (
+    <div className="max-w-xl mx-auto text-left rounded-xl p-4" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.12)" }}>
+      <div className="text-sm font-medium text-slate-100 mb-1">Trace it automatically with Claude</div>
+      <p className="text-xs text-slate-400 leading-relaxed mb-3">
+        Tracing uses Claude, Anthropic's AI, on <strong className="text-slate-200">your own Anthropic account</strong>. A trace usually costs a cent or two.
+        Your photo and key go straight from this device to Anthropic. They never touch our server, and we never see them.
+      </p>
+      {key && !editing ? (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-slate-200">Key saved <span className="font-mono text-slate-400">····{key.slice(-4)}</span></span>
+          <span className="text-xs text-slate-400">({remembered ? "remembered on this device" : "for this visit only"})</span>
+          <span className="flex-1" />
+          <button onClick={() => setEditing(true)} className="px-3 py-1.5 rounded-lg text-xs text-slate-200" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Change</button>
+          <button onClick={forget} className="px-3 py-1.5 rounded-lg text-xs" style={{ background: "rgba(180,68,78,0.18)", border: "1px solid rgba(180,68,78,0.4)", color: "#ffb4ba" }}>Forget key</button>
+        </div>
+      ) : (
+        <div>
+          <label htmlFor="bw-key" className="block text-xs text-slate-300 mb-1">Your Anthropic API key</label>
+          <div className="flex gap-2">
+            <input id="bw-key" type="password" value={draft} onChange={(e) => { setDraft(e.target.value); setWarn(""); }}
+              onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+              placeholder="sk-ant-…" autoComplete="off" spellCheck={false}
+              className="flex-1 min-w-0 px-3 py-2 rounded-lg text-sm text-slate-100 outline-none"
+              style={{ background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.15)" }} />
+            <button onClick={save} disabled={!draft.trim()} className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-40" style={{ background: "#6d5ae6" }}>Save</button>
           </div>
-          <div className="flex gap-3 justify-center">
-            <button onClick={onAnalyze} className="px-5 py-2.5 rounded-lg text-sm font-semibold text-white" style={{ background: "#6d5ae6" }}>Trace my plan →</button>
-            <button onClick={onReset} className="px-4 py-2.5 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Use a different image</button>
-          </div>
+          {warn && <div role="alert" className="text-xs mt-1.5" style={{ color: "#fde68a" }}>{warn}</div>}
+          <label className="flex items-center gap-2 text-xs text-slate-300 mt-2.5">
+            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} className="w-4 h-4" />
+            Remember on this device (leave unticked on a shared computer)
+          </label>
+          <p className="text-xs text-slate-400 mt-2.5">
+            No key yet? Make one at{" "}
+            <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer" className="underline" style={{ color: "#c7b6ff" }}>console.anthropic.com</a>
+            {" "}(you'll need to add a little credit). Or skip it: “Trace it by hand” is free.
+          </p>
+          {key && <button onClick={() => { setEditing(false); setDraft(""); setWarn(""); }} className="text-xs text-slate-400 underline mt-2">Keep my saved key</button>}
         </div>
       )}
     </div>
@@ -556,7 +643,7 @@ function Analyzing() {
 }
 
 // ================= 2D EDITOR =================
-function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRotate, savedName = "", onSave, saveStatus = "", onUndo, canUndo = false, onPushHistory, onWalk, onBack }) {
+function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRetry, onRotate, savedName = "", onSave, saveStatus = "", onUndo, canUndo = false, onPushHistory, onWalk, onBack }) {
   const canvasRef = useRef(null);
   const [saving, setSaving] = useState(false);          // inline "name this plan" panel open?
   const [nameDraft, setNameDraft] = useState(savedName); // editable name in the Save panel
@@ -1014,7 +1101,12 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-5">
-      {error && <div className="mb-3 text-sm rounded-lg px-3 py-2" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#fde68a" }}>{error}</div>}
+      {error && (
+        <div role="alert" className="mb-3 text-sm rounded-lg px-3 py-2 flex flex-wrap items-center gap-x-3 gap-y-2" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#fde68a" }}>
+          <span className="flex-1 min-w-[12rem]">{error}</span>
+          {onRetry && <button onClick={onRetry} className="px-3 py-1.5 rounded-lg text-sm font-medium text-white shrink-0" style={{ background: "#6d5ae6" }}>Try again</button>}
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2 mb-3">
         {tools.map(([k, label]) => (
           <button key={k} onClick={() => { setTool(k); setSelected(null); if (k === "scale") setScaleDraft(null); }}
