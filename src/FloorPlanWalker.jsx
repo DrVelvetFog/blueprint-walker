@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo, Suspense, laz
 // The 3D walk (and Three.js) loads only when someone presses "Build & walk it".
 const Walk = lazy(() => import("./Walk.jsx"));
 import { IS_TOUCH, CEILING_FT_DEFAULT, DOOR_W_M, FT_TO_M, FURN_TYPE_LIST, MAX_DIM, WIN_W_M, boxCorners, boxInside, ftIn, nid, pointSeg } from "./shared.js";
-import { planFromModel, cleanSavedPlan, planFileBlob, readPlanFile, planToHash, planFromHash, fmtLen, pxToFeet, renderPlanImage } from "./planio.js";
+import { planFromModel, cleanSavedPlan, planFileBlob, readPlanFile, planToHash, planFromHash, fmtLen, pxToFeet, renderPlanImage, download, fileSafe } from "./planio.js";
 import { traceWithClaude, TRACE_ERRORS, getKey, saveKey, forgetKey, keyIsRemembered, looksLikeKey } from "./vision.js";
 
 /*  Blueprint → Walkable 3D  ·  end-to-end pipeline prototype
@@ -19,6 +19,16 @@ import { traceWithClaude, TRACE_ERRORS, getKey, saveKey, forgetKey, keyIsRemembe
 // Client-only persistence so the user can save a plan, leave, and come back to walk it again.
 // Lives in localStorage (no server, no new SaaS). Each entry: { id, name, savedAt, thumb, plan }.
 const PLANS_KEY = "bw_plans";
+// default real-world size (feet: width × depth) for things added with the "Add item" tool
+const ITEM_FT = {
+  bed: [5, 6.7], sofa: [7, 3], armchair: [3, 3], chair: [1.6, 1.6], table: [5, 3], coffee_table: [4, 2],
+  desk: [4, 2], dresser: [5, 1.6], nightstand: [1.6, 1.4], wardrobe: [4, 2], bookshelf: [3, 1], tv: [4.5, 1],
+  toilet: [1.6, 2.3], tub: [2.5, 5], shower: [3, 3], sink: [2, 1.6], counter: [6, 2], stove: [2.5, 2.2],
+  fridge: [3, 2.5], rug: [6, 4], other: [2, 2], stairs: [3.5, 10],
+};
+const ITEM_TYPES = [...Object.keys(ITEM_FT).filter((k) => k !== "other"), "other"];
+const prettyType = (t) => t.replace(/_/g, " ");
+
 const FILE_ERROR = "We couldn't open that file. Try a JPG or PNG photo, or take a screenshot of the plan and use that.";
 
 function loadPlans() {
@@ -106,6 +116,9 @@ export default function FloorPlanWalker() {
   const [currentName, setCurrentName] = useState("");       // its name (prefilled into the Save box)
   const [saveStatus, setSaveStatus] = useState("");         // transient "Saved ✓" / quota message
   const [showIntro, setShowIntro] = useState(() => { try { return !localStorage.getItem("bw_intro_seen"); } catch { return false; } });
+  // feet or meters for every length shown (the plan itself is stored in pixels + a scale)
+  const [units, setUnitsState] = useState(() => { try { return localStorage.getItem("bw_units") === "m" ? "m" : "ft"; } catch { return "ft"; } });
+  const setUnits = (u) => { setUnitsState(u); try { localStorage.setItem("bw_units", u); } catch {} };
   // in-app dialogs (instead of the browser's own prompt/confirm pop-ups)
   const [dialog, setDialog] = useState(null);
   const ask = useCallback((opts) => new Promise((resolve) => setDialog({ ...opts, resolve })), []);
@@ -345,6 +358,38 @@ export default function FloorPlanWalker() {
     if (id === currentPlanId) { setCurrentPlanId(null); setCurrentName(""); }
   }, [currentPlanId]);
 
+  // ---- files, pictures and share links ----
+  const [notice, setNotice] = useState(null);   // friendly one-line status for the editor (green)
+  const currentPlan = () => ({ img, walls, openings, furniture, stairs, rooms, scale, ceiling, tidy });
+  const planName = () => currentName || "My plan";
+  const exportFile = () => { download(planFileBlob(currentPlan(), planName()), `${fileSafe(planName())}.blueprint.json`); setNotice("Plan file downloaded. Open it later from the start screen, on any device."); };
+  const exportImage = () => {
+    const c = renderPlanImage({ ...currentPlan(), walls: tidied }, { units, title: planName() });
+    c.toBlob((b) => { if (b) { download(b, `${fileSafe(planName())}-plan.png`); setNotice("Picture of the plan downloaded."); } }, "image/png");
+  };
+  const shareLink = async () => {
+    try {
+      const hash = await planToHash({ ...currentPlan(), walls: tidy ? tidied : walls }, planName());
+      const url = `${location.origin}${location.pathname}#${hash}`;
+      if (url.length > 60000) { setNotice("This plan is too big for a link. Download the plan file and send that instead."); return; }
+      await navigator.clipboard.writeText(url);
+      setNotice("Link copied. Anyone with the link can see this layout (not your photo).");
+    } catch { setNotice("Couldn't copy the link here. Download the plan file and send that instead."); }
+  };
+  const openFile = async (file) => {
+    try { const { name, plan } = await readPlanFile(file); loadPlan(plan, { name }); setNotice(`Opened “${name}”. Save it to keep it in My plans.`); }
+    catch (e) { setError(e.message); setErrorRetry(false); }
+  };
+  // a shared link (#plan=...) opens straight into the editor, then the address is tidied up
+  useEffect(() => {
+    if (!location.hash.startsWith("#plan=")) return;
+    planFromHash(location.hash).then((res) => {
+      history.replaceState(null, "", location.pathname + location.search);
+      if (res && loadPlan(res.plan, { name: res.name })) setNotice(`Opened a shared plan, “${res.name}”. Save it to keep it.`);
+      else { setError("That share link is damaged or incomplete."); setErrorRetry(false); }
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
       className="w-full min-h-screen text-slate-100"
@@ -362,7 +407,7 @@ export default function FloorPlanWalker() {
             onSkip={() => { setError(null); setStage("editor"); }}
             onKeyChange={() => setError(null)}
             error={error}
-            savedPlans={savedPlans} onOpenPlan={openPlan} onRenamePlan={renamePlan} onDeletePlan={deletePlan} ask={ask} />
+            savedPlans={savedPlans} onOpenPlan={openPlan} onRenamePlan={renamePlan} onDeletePlan={deletePlan} ask={ask} onOpenFile={openFile} />
         )}
         {stage === "analyzing" && <Analyzing />}
         {stage === "editor" && (
@@ -376,9 +421,11 @@ export default function FloorPlanWalker() {
             ceiling={ceiling} setCeiling={setCeiling}
             error={error} onRetry={errorRetry && img?.url ? analyze : null} onRotate={rotatePlan}
             savedName={currentName} onSave={savePlan} saveStatus={saveStatus}
-            onUndo={undo} canUndo={canUndo} onPushHistory={pushHistory}
+            onUndo={undo} canUndo={canUndo} onRedo={redo} canRedo={canRedo} onPushHistory={pushHistory}
+            units={units} setUnits={setUnits} ask={ask}
+            notice={notice} onNotice={setNotice} onExportFile={exportFile} onExportImage={exportImage} onShareLink={shareLink}
             onWalk={() => setStage("walk")}
-            onBack={() => { setError(null); setStage("upload"); }}
+            onBack={() => { setError(null); setNotice(null); setStage("upload"); }}
           />
         )}
         {stage === "walk" && (
@@ -489,8 +536,8 @@ function Header({ stage, onHelp }) {
 }
 
 // ---------- upload ----------
-function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, onKeyChange, error, ask, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
-  const fileRef = useRef(null), camRef = useRef(null);
+function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, onKeyChange, error, ask, onOpenFile, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
+  const fileRef = useRef(null), camRef = useRef(null), planFileRef = useRef(null);
   const [drag, setDrag] = useState(false);
   const [hasKey, setHasKey] = useState(() => !!getKey());
   const drop = (e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); };
@@ -515,9 +562,11 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
               {IS_TOUCH && <button onClick={() => camRef.current?.click()} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>Take a photo</button>}
               <button onClick={onBlank} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(124,255,203,0.14)", border: "1px solid rgba(124,255,203,0.4)" }}>Draw a new plan</button>
               <button onClick={onSample} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Try a sample</button>
+              <button onClick={() => planFileRef.current?.click()} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Open a plan file</button>
             </div>
             <div className="text-slate-500 text-xs mt-4">“Draw a new plan” gives you a blank grid where 1 square = 1 foot — no photo needed.</div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
+            <input ref={planFileRef} type="file" accept=".json,application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onOpenFile?.(f); }} />
             <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
           </div>
           {savedPlans.length > 0 && (
@@ -655,7 +704,7 @@ function Analyzing() {
 }
 
 // ================= 2D EDITOR =================
-function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRetry, onRotate, savedName = "", onSave, saveStatus = "", onUndo, canUndo = false, onPushHistory, onWalk, onBack }) {
+function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRetry, onRotate, savedName = "", onSave, saveStatus = "", onUndo, canUndo = false, onRedo, canRedo = false, onPushHistory, units = "ft", setUnits, ask, notice, onNotice, onExportFile, onExportImage, onShareLink, onWalk, onBack }) {
   const canvasRef = useRef(null);
   const HIT = IS_TOUCH ? 2 : 1;                       // fingers are bigger than mouse pointers
   const [saving, setSaving] = useState(false);          // inline "name this plan" panel open?
@@ -667,6 +716,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   const drag = useRef(null);                       // active interaction
   const gesture = useRef(null);                    // active two-finger pinch/pan
   const [tool, setTool] = useState("move");
+  const [addType, setAddType] = useState("bed");          // what the "Add item" tool places
   const [showImg, setShowImg] = useState(true);
   const [selected, setSelected] = useState(null); // { kind:'furn'|'stair', id } currently-selected box
   const [scaleDraft, setScaleDraft] = useState(null); // {x1,y1,x2,y2}
@@ -737,6 +787,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     x.clearRect(0, 0, size.w, size.h);
     // backdrop
     x.fillStyle = "rgba(255,255,255,0.02)"; x.fillRect(0, 0, size.w, size.h);
+    const pills = roomPills();
     if (bg.current && showImg) {
       x.save();
       x.globalAlpha = 0.45;
@@ -761,9 +812,12 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       x.fillStyle = "rgba(94,234,212,0.14)"; x.strokeStyle = "rgba(94,234,212,0.75)"; x.lineWidth = 1.5;
       x.beginPath(); x.rect(-w / 2, -h / 2, w, h); x.fill(); x.stroke();
       x.restore();
-      x.fillStyle = "rgba(190,255,242,0.92)"; x.font = "10px ui-sans-serif, system-ui, sans-serif";
-      x.textAlign = "center"; x.textBaseline = "middle";
-      x.fillText(f.type, c.x, c.y);
+      // the type name, unless a room name already sits on this spot (they used to overlap)
+      if (!pills.some((q) => Math.abs(c.x - q.x) < q.hw + 18 && Math.abs(c.y - q.y) < q.hh + 8)) {
+        x.fillStyle = "rgba(190,255,242,0.92)"; x.font = "10px ui-sans-serif, system-ui, sans-serif";
+        x.textAlign = "center"; x.textBaseline = "middle";
+        x.fillText(prettyType(f.type), c.x, c.y);
+      }
     });
     // staircases: amber box with tread hints + label (a feature, never a wall)
     stairs.forEach((s) => {
@@ -827,17 +881,33 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       x.beginPath(); x.arc(p.x, p.y, isSel ? 7 : 6, 0, Math.PI * 2); x.fill();
       x.strokeStyle = "rgba(0,0,0,0.4)"; x.lineWidth = 1.5; x.stroke();
     });
-    // room name labels (on top), with a soft pill behind for legibility
-    rooms.forEach((r) => {
-      if (!r.name) return;
-      const c = toScreen(r.x, r.y);
-      x.font = "600 12px ui-sans-serif, system-ui, sans-serif";
-      x.textAlign = "center"; x.textBaseline = "middle";
-      const tw = x.measureText(r.name).width;
-      x.fillStyle = "rgba(12,10,31,0.55)";
-      x.beginPath(); x.rect(c.x - tw / 2 - 6, c.y - 10, tw + 12, 20); x.fill();
-      x.fillStyle = "#ece9f5"; x.fillText(r.name, c.x, c.y);
+    // room name labels (on top), with a soft pill behind for legibility; ring the selected one
+    pills.forEach((q) => {
+      const isSel = selected?.kind === "room" && selected.id === q.r.id;
+      x.font = labelFont; x.textAlign = "center"; x.textBaseline = "middle";
+      x.fillStyle = isSel ? "rgba(124,255,203,0.22)" : "rgba(12,10,31,0.55)";
+      x.beginPath(); x.rect(q.x - q.hw, q.y - q.hh, q.hw * 2, q.hh * 2); x.fill();
+      if (isSel) { x.strokeStyle = "#7CFFCB"; x.lineWidth = 2; x.strokeRect(q.x - q.hw, q.y - q.hh, q.hw * 2, q.hh * 2); }
+      x.fillStyle = "#ece9f5"; x.fillText(q.r.name, q.x, q.y);
     });
+    // length of the selected wall, and of a wall being drawn
+    const lengthTag = (ax, ay, bx, by, text) => {
+      if (!text) return;
+      const mx = (ax + bx) / 2, my = (ay + by) / 2, L = Math.hypot(bx - ax, by - ay) || 1;
+      const nx = -(by - ay) / L * 16, ny = (bx - ax) / L * 16;
+      x.font = "600 11px ui-sans-serif, system-ui, sans-serif"; x.textAlign = "center"; x.textBaseline = "middle";
+      const tw = x.measureText(text).width;
+      x.fillStyle = "rgba(12,10,31,0.85)"; x.fillRect(mx + nx - tw / 2 - 5, my + ny - 9, tw + 10, 18);
+      x.fillStyle = "#7CFFCB"; x.fillText(text, mx + nx, my + ny);
+    };
+    if (selWallId) {
+      const w = (overlay ? tidied : walls).find((q) => q.id === selWallId);
+      if (w) { const a = toScreen(w.x1, w.y1), b = toScreen(w.x2, w.y2); lengthTag(a.x, a.y, b.x, b.y, lenLabel(Math.hypot(w.x2 - w.x1, w.y2 - w.y1))); }
+    }
+    if (drag.current?.type === "newwall") {
+      const dc = drag.current, a = toScreen(dc.x1, dc.y1), b = toScreen(dc.x2, dc.y2);
+      lengthTag(a.x, a.y, b.x, b.y, lenLabel(Math.hypot(dc.x2 - dc.x1, dc.y2 - dc.y1)));
+    }
     // scale draft
     const sd = scaleDraft;
     if (sd) {
@@ -857,7 +927,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         boxCorners(o).forEach((cn) => { const p = toScreen(cn.x, cn.y); x.fillStyle = "#7CFFCB"; x.strokeStyle = "#0c0a1f"; x.lineWidth = 1.5; x.beginPath(); x.rect(p.x - 5, p.y - 5, 10, 10); x.fill(); x.stroke(); });
       }
     }
-  }, [img, size, walls, tidied, tidy, openings, furniture, stairs, rooms, selected, scale, scaleDraft, showImg, recompute]);
+  }, [img, size, walls, tidied, tidy, openings, furniture, stairs, rooms, selected, scale, scaleDraft, showImg, recompute, units]);
 
   useEffect(() => { draw(); }, [draw]);
 
@@ -868,12 +938,20 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     draw();
   };
   const fitView = () => { view.current = { zoom: 1, panx: 0, pany: 0, rot: 0 }; draw(); };
-  // wheel zooms; Shift+wheel rotates the view (desktop equivalent of a two-finger twist)
-  const onWheel = (e) => {
-    e.preventDefault();
-    if (e.shiftKey) { view.current.rot = (view.current.rot || 0) + (e.deltaY < 0 ? -1 : 1) * 0.08; draw(); }
-    else applyZoom(e.deltaY < 0 ? 1.12 : 1 / 1.12);
+  // Ctrl/Cmd + scroll zooms (a trackpad pinch arrives as Ctrl + scroll); Shift + scroll turns the view.
+  // A plain scroll scrolls the page, so the buttons under the plan stay reachable on a laptop.
+  // Native listener: React's onWheel is passive, so it can't stop the page from scrolling.
+  const wheelRef = useRef(null);
+  wheelRef.current = (e) => {
+    if (e.shiftKey) { e.preventDefault(); view.current.rot = (view.current.rot || 0) + (e.deltaY < 0 ? -1 : 1) * 0.08; draw(); }
+    else if (e.ctrlKey || e.metaKey) { e.preventDefault(); applyZoom(e.deltaY < 0 ? 1.12 : 1 / 1.12); }
   };
+  useEffect(() => {
+    const c = canvasRef.current; if (!c) return;
+    const h = (e) => wheelRef.current?.(e);
+    c.addEventListener("wheel", h, { passive: false });
+    return () => c.removeEventListener("wheel", h);
+  }, []);
 
   // delete the selected box with the keyboard (desktop), ignoring text fields
   useEffect(() => {
@@ -898,6 +976,23 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     let best = null;
     walls.forEach((w) => { const d = pointSeg(px, py, w.x1, w.y1, w.x2, w.y2); if (!best || d.dist < best.dist) best = { ...d, w }; });
     return best;
+  };
+
+  // real-world size helpers (plan px <-> feet), and a length label in the user's units
+  const pxPerFt = () => (scale ? (scale.unit === "ft" ? scale.pixelsPerUnit : scale.pixelsPerUnit * FT_TO_M) : (img ? img.w / 40 : 24));
+  const lenLabel = (px) => { const f = pxToFeet(px, scale); return f == null ? null : fmtLen(f, units); };
+
+  // room-name pills on screen (shared by drawing and hit-testing)
+  const labelFont = "600 12px ui-sans-serif, system-ui, sans-serif";
+  const roomPills = () => {
+    const c = canvasRef.current; if (!c) return [];
+    const x = c.getContext("2d"); x.font = labelFont;
+    return rooms.filter((r) => r.name).map((r) => { const p = toScreen(r.x, r.y), tw = x.measureText(r.name).width; return { r, x: p.x, y: p.y, hw: tw / 2 + 6, hh: 10 }; });
+  };
+  const hitRoom = (sx, sy) => {
+    const pad = 4 * HIT, list = roomPills();
+    for (let i = list.length - 1; i >= 0; i--) { const q = list[i]; if (Math.abs(sx - q.x) <= q.hw + pad && Math.abs(sy - q.y) <= q.hh + pad) return q.r; }
+    return null;
   };
 
   // snap a coordinate to the foot grid when drawing on the blank "Draw a new plan" canvas
@@ -933,6 +1028,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     const { kind, id } = selected;
     if (kind === "wall") setWalls((a) => a.filter((w) => w.id !== id));
     else if (kind === "opening") setOpenings((a) => a.filter((o) => o.id !== id));
+    else if (kind === "room") setRooms((a) => a.filter((r) => r.id !== id));
     else delBox(kind, id);
     setSelected(null);
   };
@@ -976,7 +1072,19 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       }
       return;
     }
+    if (tool === "item") {
+      const f = ITEM_FT[addType] || ITEM_FT.other, k = pxPerFt();
+      const o = { id: nid(), x, y, w: f[0] * k, h: f[1] * k, deg: 0 };
+      onPushHistory?.();
+      if (addType === "stairs") { setStairs((a) => [...a, o]); setSelected({ kind: "stair", id: o.id }); }
+      else { setFurniture((a) => [...a, { ...o, type: addType }]); setSelected({ kind: "furn", id: o.id }); }
+      setTool("move");
+      return;
+    }
+    if (tool === "label") { drag.current = { type: "label", x, y }; return; } // asks for the name on release
     if (tool === "erase") {
+      const rh = hitRoom(sx, sy);
+      if (rh) { onPushHistory?.(); setRooms((a) => a.filter((r) => r.id !== rh.id)); return; }
       // opening first
       const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 10 * HIT; });
       if (oh) { onPushHistory?.(); setOpenings((o) => o.filter((q) => q.id !== oh.id)); return; }
@@ -1004,6 +1112,8 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     }
     const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 9 * HIT; });
     if (oh) { setSelected({ kind: "opening", id: oh.id }); drag.current = { type: "opening", id: oh.id }; return; }
+    const rh = hitRoom(sx, sy);
+    if (rh) { setSelected({ kind: "room", id: rh.id }); drag.current = { type: "roommove", id: rh.id, gx: rh.x - x, gy: rh.y - y }; return; }
     if (bh) { setSelected({ kind: bh.kind, id: bh.o.id }); drag.current = { type: "boxmove", kind: bh.kind, id: bh.o.id, gx: bh.o.x - x, gy: bh.o.y - y }; return; }
     // tap on a wall line (away from its ends): select it and drag the whole wall
     const nw = nearestWall(x, y);
@@ -1034,7 +1144,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     const { x, y } = getXY(e);
     const d = drag.current;
     // snapshot once, on the first real move of a geometry-changing drag (not on a plain tap)
-    if (!d.histPushed && ["endpoint", "wallmove", "opening", "boxmove", "boxresize"].includes(d.type)) { onPushHistory?.(); d.histPushed = true; }
+    if (!d.histPushed && ["endpoint", "wallmove", "opening", "boxmove", "boxresize", "roommove"].includes(d.type)) { onPushHistory?.(); d.histPushed = true; }
     if (d.type === "endpoint") {
       const sp = snapEndpoint(x, y, d.id);   // connect to a nearby corner, else grid-snap
       // editing a wall counts as reviewing it → clear any "uncertain" flag (conf:1)
@@ -1049,6 +1159,8 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     } else if (d.type === "opening") {
       const nw = nearestWall(x, y);
       setOpenings((o) => o.map((q) => q.id === d.id ? { ...q, x: nw ? nw.cx : x, y: nw ? nw.cy : y } : q));
+    } else if (d.type === "roommove") {
+      setRooms((a) => a.map((r) => (r.id === d.id ? { ...r, x: x + d.gx, y: y + d.gy } : r)));
     } else if (d.type === "boxmove") {
       setBox(d.kind, d.id, { x: x + d.gx, y: y + d.gy });
     } else if (d.type === "boxresize") {
@@ -1066,6 +1178,15 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         onPushHistory?.();
         setWalls((w) => [...w, { id: nid(), x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2 }]);
       }
+    }
+    if (d?.type === "label") {
+      // asked on release, so the rest of this tap can't pull focus away from the name box
+      ask?.({ title: "Name this room", input: "", confirmLabel: "Add" }).then((name) => {
+        if (!name) return;
+        onPushHistory?.();
+        const r = { id: nid(), name: name.slice(0, 40), x: d.x, y: d.y };
+        setRooms((a) => [...a, r]); setSelected({ kind: "room", id: r.id }); setTool("move");
+      });
     }
     if (d?.type === "scale") {
       const len = Math.hypot(scaleDraft.x2 - scaleDraft.x1, scaleDraft.y2 - scaleDraft.y1);
@@ -1100,136 +1221,163 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
   if (scale && walls.length) {
     let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
     walls.forEach((w) => { minx = Math.min(minx, w.x1, w.x2); maxx = Math.max(maxx, w.x1, w.x2); miny = Math.min(miny, w.y1, w.y2); maxy = Math.max(maxy, w.y1, w.y2); });
-    // always report in feet-and-inches, converting from meters if the scale was set in m
-    const toFeet = (vpx) => {
-      const inUnit = vpx / scale.pixelsPerUnit;
-      return scale.unit === "ft" ? inUnit : inUnit / FT_TO_M;
-    };
-    dims = `${ftIn(toFeet(maxx - minx))} × ${ftIn(toFeet(maxy - miny))}`;
+    dims = `${lenLabel(maxx - minx)} × ${lenLabel(maxy - miny)}`;
   }
 
   const uncertainCount = walls.filter((w) => (w.conf ?? 1) < 0.6).length;
 
-  const tools = [["move", "Move"], ["wall", "Add wall"], ["door", "Door"], ["window", "Window"], ["scale", "Set scale"], ["erase", "Erase"]];
+  // ---- Issues: things worth a look before walking, each one tap-to-jump ----
+  const issues = useMemo(() => {
+    const out = [];
+    const W = tidy ? tidied : walls;
+    if (walls.length < 3) out.push({ key: "few", text: "Add at least 3 walls so you can walk through it.", tool: "wall" });
+    if (!scale) out.push({ key: "scale", text: "The real size isn't set, so sizes are a guess.", tool: "scale" });
+    walls.forEach((w) => { if ((w.conf ?? 1) < 0.6) out.push({ key: "u" + w.id, text: "A wall we weren't sure about.", sel: { kind: "wall", id: w.id }, at: [(w.x1 + w.x2) / 2, (w.y1 + w.y2) / 2] }); });
+    let loose = 0;
+    W.forEach((w) => [[w.x1, w.y1], [w.x2, w.y2]].forEach(([ex, ey], k) => {
+      if (loose >= 8) return;
+      const meets = W.some((o) => o.id !== w.id && pointSeg(ex, ey, o.x1, o.y1, o.x2, o.y2).dist <= TIDY_WELD_PX);
+      if (!meets) { loose++; out.push({ key: "e" + w.id + k, text: "A wall end that doesn't meet another wall.", sel: { kind: "wall", id: w.id }, at: [ex, ey] }); }
+    }));
+    openings.forEach((o) => {
+      let best = 1e9; W.forEach((w) => { best = Math.min(best, pointSeg(o.x, o.y, w.x1, w.y1, w.x2, w.y2).dist); });
+      if (best > 14) out.push({ key: "o" + o.id, text: `A ${o.type} that isn't on a wall.`, sel: { kind: "opening", id: o.id }, at: [o.x, o.y] });
+    });
+    return out;
+  }, [walls, tidied, tidy, openings, scale]);
+  const [showIssues, setShowIssues] = useState(false);
+  // center the view on a plan point (pan is applied before the view's rotation)
+  const focusOn = (px, py) => {
+    recompute();
+    const p = toScreen(px, py), dx = size.w / 2 - p.x, dy = size.h / 2 - p.y, th = view.current.rot || 0;
+    view.current.panx += Math.cos(th) * dx + Math.sin(th) * dy;
+    view.current.pany += -Math.sin(th) * dx + Math.cos(th) * dy;
+    if (view.current.zoom < 1.6) view.current.zoom = 1.6;
+    draw();
+  };
+  const openIssue = (it) => {
+    if (it.tool) { setTool(it.tool); setSelected(null); if (it.tool === "scale") setScaleDraft(null); return; }
+    setTool("move"); setSelected(it.sel); if (it.at) focusOn(it.at[0], it.at[1]);
+  };
+
+  const [sharing, setSharing] = useState(false);
+  const tools = [["move", "Move"], ["wall", "Add wall"], ["door", "Door"], ["window", "Window"], ["item", "Add item"], ["label", "Room name"], ["scale", "Set real size"], ["erase", "Erase"]];
+  const toolHint = {
+    wall: "Drag to draw a wall. Ends snap onto nearby corners.",
+    door: "Tap on a wall to add a door.",
+    window: "Tap on a wall to add a window.",
+    item: null,
+    label: "Tap where the room's name should go.",
+    erase: "Tap anything to remove it.",
+  }[tool];
+  const btn = { background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" };
+
+  // the piece that's selected right now, for the bar over the drawing
+  let sel = null;
+  if (selected) {
+    if (selected.kind === "wall") { const o = walls.find((w) => w.id === selected.id); sel = o && { kind: "wall", o }; }
+    else if (selected.kind === "opening") { const o = openings.find((q) => q.id === selected.id); sel = o && { kind: "opening", o }; }
+    else if (selected.kind === "room") { const o = rooms.find((r) => r.id === selected.id); sel = o && { kind: "room", o }; }
+    else sel = boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id) || null;
+  }
+  const setOpeningWidth = (id, w) => setOpenings((a) => a.map((q) => (q.id === id ? { ...q, w: Math.max(4, w) } : q)));
+  const inch = scale ? pxPerFt() / 12 : null; // plan px per inch, when the real size is known
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-5">
+    <div className="max-w-6xl mx-auto px-3 sm:px-4 py-4 sm:py-5">
       {error && (
         <div role="alert" className="mb-3 text-sm rounded-lg px-3 py-2 flex flex-wrap items-center gap-x-3 gap-y-2" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#fde68a" }}>
           <span className="flex-1 min-w-[12rem]">{error}</span>
-          {onRetry && <button onClick={onRetry} className="px-3 py-1.5 rounded-lg text-sm font-medium text-white shrink-0" style={{ background: "#6d5ae6" }}>Try again</button>}
+          {onRetry && <button onClick={onRetry} className="min-h-10 px-3 rounded-lg text-sm font-medium text-white shrink-0" style={{ background: "#6d5ae6" }}>Try again</button>}
         </div>
       )}
-      <div className="flex flex-wrap items-center gap-2 mb-3">
+      {notice && (
+        <div role="status" className="mb-3 text-sm rounded-lg px-3 py-2 flex items-center gap-3" style={{ background: "rgba(124,255,203,0.08)", border: "1px solid rgba(124,255,203,0.3)", color: "#c9fbe8" }}>
+          <span className="flex-1">{notice}</span>
+          <button onClick={() => onNotice?.(null)} aria-label="Dismiss" className="min-w-9 min-h-9 rounded text-slate-300">✕</button>
+        </div>
+      )}
+
+      {/* tools */}
+      <div className="flex flex-wrap items-center gap-2 mb-2" role="toolbar" aria-label="Editing tools">
         {tools.map(([k, label]) => (
-          <button key={k} onClick={() => { setTool(k); setSelected(null); if (k === "scale") setScaleDraft(null); }}
+          <button key={k} onClick={() => { setTool(k); setSelected(null); if (k === "scale") setScaleDraft(null); }} aria-pressed={tool === k}
             className="pointer-coarse:min-h-11 px-3 py-1.5 rounded-lg text-sm"
             style={{ background: tool === k ? "#6d5ae6" : "rgba(255,255,255,0.06)", border: "1px solid " + (tool === k ? "#8b78ff" : "rgba(255,255,255,0.12)"), color: tool === k ? "#fff" : "#cbd5e1" }}>
             {label}
           </button>
         ))}
-        <button onClick={() => onUndo?.()} disabled={!canUndo} title="Undo last change (Ctrl/Cmd+Z)"
-          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm flex items-center gap-1"
-          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", color: canUndo ? "#cbd5e1" : "#64748b", opacity: canUndo ? 1 : 0.5, cursor: canUndo ? "pointer" : "default" }}>
-          ↶ Undo
-        </button>
+        <span className="flex gap-1">
+          <button onClick={() => onUndo?.()} disabled={!canUndo} title="Undo (Ctrl/Cmd+Z)" aria-label="Undo"
+            className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm disabled:opacity-40" style={{ ...btn, color: "#cbd5e1" }}>↶ Undo</button>
+          <button onClick={() => onRedo?.()} disabled={!canRedo} title="Redo (Ctrl/Cmd+Shift+Z)" aria-label="Redo"
+            className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm disabled:opacity-40" style={{ ...btn, color: "#cbd5e1" }}>↷ Redo</button>
+        </span>
         <div className="flex-1" />
-        <button onClick={() => { setNameDraft(savedName || ""); setSaving(true); }} title="Save this plan to come back to later"
-          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
-          💾 Save
-        </button>
-        <button onClick={() => { onPushHistory?.(); onRotate(); }} title="Rotate the whole plan 90° (drag with two fingers to free-rotate the view)"
-          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
-          ↻ Rotate 90°
-        </button>
-        <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
-          <input type="checkbox" checked={tidy} onChange={(e) => setTidy?.(e.target.checked)} /> tidy up the drawing
+        <button onClick={() => { setSharing(false); setNameDraft(savedName || ""); setSaving((v) => !v); }} title="Save this plan in this browser"
+          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200" style={btn}>💾 Save</button>
+        <button onClick={() => { setSaving(false); setSharing((v) => !v); }} aria-expanded={sharing}
+          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200" style={btn}>⇪ Share &amp; download</button>
+        <button onClick={() => { onPushHistory?.(); onRotate(); }} title="Turn the whole plan 90° (twist two fingers to turn just the view)"
+          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200" style={btn}>↻ Rotate 90°</button>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 text-xs text-slate-300">
+        <label className="flex items-center gap-1.5 select-none cursor-pointer min-h-9">
+          <input type="checkbox" className="w-4 h-4" checked={tidy} onChange={(e) => setTidy?.(e.target.checked)} /> tidy up the drawing
         </label>
-        <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
-          <input type="checkbox" checked={showImg} onChange={(e) => setShowImg(e.target.checked)} /> show drawing
-        </label>
+        {img?.url && (
+          <label className="flex items-center gap-1.5 select-none cursor-pointer min-h-9">
+            <input type="checkbox" className="w-4 h-4" checked={showImg} onChange={(e) => setShowImg(e.target.checked)} /> show my photo
+          </label>
+        )}
+        {toolHint && <span className="text-slate-300">{toolHint}</span>}
       </div>
 
       {saving && (
         <div className="mb-3 rounded-lg px-3 py-3 text-sm flex flex-wrap items-center gap-2" style={{ background: "rgba(124,99,255,0.1)", border: "1px solid rgba(124,99,255,0.3)" }}>
-          <span className="text-slate-200">Name this plan:</span>
-          <input autoFocus value={nameDraft} onChange={(e) => setNameDraft(e.target.value)}
+          <label htmlFor="bw-plan-name" className="text-slate-200">Name this plan:</label>
+          <input id="bw-plan-name" autoFocus value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} maxLength={40}
             onKeyDown={(e) => { if (e.key === "Enter") onSave?.(nameDraft); }}
-            placeholder="e.g. Our house" className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
-          <button onClick={() => onSave?.(nameDraft)} className="px-3 py-1 rounded text-white" style={{ background: "#6d5ae6" }}>Save</button>
-          <button onClick={() => setSaving(false)} className="px-3 py-1 rounded text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>Close</button>
-          {saveStatus && <span style={{ color: "#7CFFCB" }}>{saveStatus}</span>}
-          <span className="w-full text-xs text-slate-400">Saved on this device — find it under “My plans” on the start screen.</span>
+            placeholder="e.g. Our house" className="min-h-10 px-2 rounded bg-black/30 border border-white/15 text-white" />
+          <button onClick={() => onSave?.(nameDraft)} className="min-h-10 px-3 rounded text-white" style={{ background: "#6d5ae6" }}>Save</button>
+          <button onClick={() => setSaving(false)} className="min-h-10 px-3 rounded text-slate-300" style={btn}>Close</button>
+          <span aria-live="polite" style={{ color: "#7CFFCB" }}>{saveStatus}</span>
+          <span className="w-full text-xs text-slate-400">Saved in this browser only. Find it under “My plans” on the start screen. To move it to another device, use Share &amp; download.</span>
         </div>
       )}
 
-      <div ref={wrapRef} className="rounded-xl overflow-hidden relative" style={{ border: "1px solid rgba(255,255,255,0.12)", touchAction: "none" }}>
-        <canvas ref={canvasRef}
-          onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
-          onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
-          onWheel={onWheel}
-          style={{ display: "block", cursor: tool === "move" ? "grab" : "crosshair" }} />
-        {/* zoom controls (pinch to zoom + two-finger drag to pan also work) */}
-        <div className="absolute bottom-3 right-3 flex flex-col gap-1.5 select-none">
-          {[["+", () => applyZoom(1.3)], ["⤢", fitView], ["−", () => applyZoom(1 / 1.3)]].map(([label, fn], i) => (
-            <button key={i} onClick={fn} title={label === "⤢" ? "Fit to screen" : label === "+" ? "Zoom in" : "Zoom out"}
-              aria-label={label === "⤢" ? "Fit to screen" : label === "+" ? "Zoom in" : "Zoom out"} className="w-9 h-9 pointer-coarse:w-11 pointer-coarse:h-11 rounded-lg text-lg font-medium text-white flex items-center justify-center"
-              style={{ background: "rgba(20,16,46,0.85)", border: "1px solid rgba(255,255,255,0.18)" }}>{label}</button>
-          ))}
-        </div>
-      </div>
-
-      {/* control bar for whatever is selected — wall / door / window / furniture / stairs */}
-      {(() => {
-        if (!selected) return null;
-        let sel = null;
-        if (selected.kind === "wall") { const o = walls.find((w) => w.id === selected.id); sel = o && { kind: "wall", o }; }
-        else if (selected.kind === "opening") { const o = openings.find((p) => p.id === selected.id); sel = o && { kind: "opening", o }; }
-        else sel = boxList().find((b) => b.kind === selected.kind && b.o.id === selected.id);
-        if (!sel) return null;
-        const wallUnsure = sel.kind === "wall" && (sel.o.conf ?? 1) < 0.6;
-        const label = sel.kind === "furn" ? "Furniture" : sel.kind === "stair" ? "Staircase"
-          : sel.kind === "wall" ? (wallUnsure ? "Wall (unsure)" : "Wall") : (sel.o.type === "door" ? "Door" : "Window");
-        const hint = sel.kind === "wall" ? (wallUnsure ? "we weren't sure about this one — fix it, or tap “looks right”" : "drag the wall to move it · drag an end to reshape")
-          : sel.kind === "opening" ? "drag it along a wall to move it"
-          : "drag the box to move · drag a corner to resize";
-        return (
-          <div className="mt-3 rounded-lg px-3 py-2.5 flex flex-wrap items-center gap-3 text-sm" style={{ background: "rgba(124,255,203,0.08)", border: "1px solid rgba(124,255,203,0.3)" }}>
-            <span style={{ color: "#7CFFCB" }}>{label} selected</span>
-            {sel.kind === "furn" && (
-              <label className="flex items-center gap-1.5 text-slate-300">this is a
-                <select value={sel.o.type} onChange={(e) => { onPushHistory?.(); setBox("furn", sel.o.id, { type: e.target.value }); }}
-                  className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
-                  {FURN_TYPE_LIST.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}
-                </select>
-              </label>
-            )}
-            {sel.kind === "opening" && (
-              <button onClick={() => { onPushHistory?.(); setOpenings((o) => o.map((q) => q.id === sel.o.id ? { ...q, type: q.type === "door" ? "window" : "door" } : q)); }}
-                className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)" }}>
-                make it a {sel.o.type === "door" ? "window" : "door"}
-              </button>
-            )}
-            {wallUnsure && (
-              <button onClick={() => { onPushHistory?.(); setWalls((a) => a.map((w) => w.id === sel.o.id ? { ...w, conf: 1 } : w)); }}
-                className="px-2.5 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.18)", border: "1px solid rgba(124,255,203,0.45)" }}>
-                looks right ✓
-              </button>
-            )}
-            <span className="text-slate-400 text-xs">{hint}</span>
-            <button onClick={deleteSelected}
-              className="ml-auto px-3 py-1 rounded text-white text-xs font-medium" style={{ background: "#b4444e" }}>Delete</button>
+      {sharing && (
+        <div className="mb-3 rounded-lg px-3 py-3 text-sm" style={{ background: "rgba(124,99,255,0.1)", border: "1px solid rgba(124,99,255,0.3)" }}>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={onShareLink} className="min-h-10 px-3 rounded-lg text-white" style={{ background: "#6d5ae6" }}>🔗 Copy a share link</button>
+            <button onClick={onExportImage} className="min-h-10 px-3 rounded-lg text-slate-200" style={btn}>🖼 Download a picture</button>
+            <button onClick={onExportFile} className="min-h-10 px-3 rounded-lg text-slate-200" style={btn}>⬇ Download the plan file</button>
+            <button onClick={() => setSharing(false)} className="min-h-10 px-3 rounded-lg text-slate-300 ml-auto" style={btn}>Close</button>
           </div>
-        );
-      })()}
+          <p className="text-xs text-slate-400 mt-2">
+            A share link holds the layout itself (not your photo), so anyone with the link can see it. The plan file keeps everything, photo included, and opens from “Open a plan file” on the start screen.
+          </p>
+        </div>
+      )}
 
-      {/* scale input panel */}
+      {/* item picker for "Add item" */}
+      {tool === "item" && (
+        <div className="mb-3 rounded-lg px-3 py-2.5 text-sm flex flex-wrap items-center gap-2" style={{ background: "rgba(94,234,212,0.08)", border: "1px solid rgba(94,234,212,0.3)" }}>
+          <label htmlFor="bw-item" className="text-slate-200">Add a</label>
+          <select id="bw-item" value={addType} onChange={(e) => setAddType(e.target.value)} className="min-h-10 px-2 rounded bg-black/30 border border-white/15 text-white">
+            {ITEM_TYPES.map((k) => <option key={k} value={k}>{prettyType(k)}</option>)}
+          </select>
+          <span className="text-slate-300">then tap the plan where it goes. You can drag it and resize it after.</span>
+        </div>
+      )}
+
+      {/* real-size panel (above the drawing, so it's on screen while you draw the line) */}
       {tool === "scale" && (
-        <div className="mt-3 rounded-lg px-3 py-3 text-sm" style={{ background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.3)" }}>
+        <div className="mb-3 rounded-lg px-3 py-3 text-sm" style={{ background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.3)" }}>
           <div className="flex flex-wrap items-center gap-2 mb-2">
             <span className="text-amber-200 mr-1">How do you want to set the real size?</span>
             {[["grid", "On grid paper"], ["wall", "I know a wall's length"]].map(([k, label]) => (
-              <button key={k} onClick={() => setScaleMode(k)} className="px-2.5 py-1 rounded text-xs"
+              <button key={k} onClick={() => setScaleMode(k)} aria-pressed={scaleMode === k} className="min-h-9 px-2.5 rounded text-xs"
                 style={{ background: scaleMode === k ? "#d97706" : "rgba(255,255,255,0.06)", border: "1px solid " + (scaleMode === k ? "#f59e0b" : "rgba(255,255,255,0.15)"), color: scaleMode === k ? "#fff" : "#fde68a" }}>
                 {label}
               </button>
@@ -1238,36 +1386,103 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
           {scaleMode === "grid" ? (
             <div className="flex flex-wrap items-center gap-2 text-amber-100">
               <span>Drag a line along the grid, then tell me how many squares it crossed:</span>
-              <input type="number" placeholder="squares" value={scaleInput.squares}
+              <input type="number" inputMode="decimal" aria-label="Number of squares" placeholder="squares" value={scaleInput.squares}
                 onChange={(e) => setScaleInput((s) => ({ ...s, squares: e.target.value }))}
-                className="w-24 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
+                className="w-24 min-h-10 px-2 rounded bg-black/30 border border-white/15 text-white" />
               <span className="text-amber-200/80">squares,</span>
-              <input type="number" value={scaleInput.ftPerSq}
+              <input type="number" inputMode="decimal" aria-label="Feet per square" value={scaleInput.ftPerSq}
                 onChange={(e) => setScaleInput((s) => ({ ...s, ftPerSq: e.target.value }))}
-                className="w-16 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
+                className="w-16 min-h-10 px-2 rounded bg-black/30 border border-white/15 text-white" />
               <span className="text-amber-200/80">ft per square</span>
               <button onClick={applyScale} disabled={!scaleInput._px || !(parseFloat(scaleInput.squares) > 0)}
-                className="px-3 py-1 rounded text-white" style={{ background: scaleInput._px && parseFloat(scaleInput.squares) > 0 ? "#d97706" : "rgba(255,255,255,0.1)" }}>Set</button>
+                className="min-h-10 px-3 rounded text-white disabled:opacity-40" style={{ background: "#d97706" }}>Set</button>
             </div>
           ) : (
             <div className="flex flex-wrap items-center gap-2 text-amber-100">
               <span>Trace one wall you know the length of, then type how long it really is:</span>
-              <input type="number" placeholder="length" value={scaleInput.len}
+              <input type="number" inputMode="decimal" aria-label="Real length" placeholder="length" value={scaleInput.len}
                 onChange={(e) => setScaleInput((s) => ({ ...s, len: e.target.value }))}
-                className="w-24 px-2 py-1 rounded bg-black/30 border border-white/15 text-white" />
-              <select value={scaleInput.unit} onChange={(e) => setScaleInput((s) => ({ ...s, unit: e.target.value }))}
-                className="px-2 py-1 rounded bg-black/30 border border-white/15 text-white">
+                className="w-24 min-h-10 px-2 rounded bg-black/30 border border-white/15 text-white" />
+              <select aria-label="Unit" value={scaleInput.unit} onChange={(e) => setScaleInput((s) => ({ ...s, unit: e.target.value }))}
+                className="min-h-10 px-2 rounded bg-black/30 border border-white/15 text-white">
                 <option value="ft">feet</option><option value="m">meters</option>
               </select>
               <button onClick={applyScale} disabled={!scaleInput._px || !scaleInput.len}
-                className="px-3 py-1 rounded text-white" style={{ background: scaleInput._px && scaleInput.len ? "#d97706" : "rgba(255,255,255,0.1)" }}>Set</button>
+                className="min-h-10 px-3 rounded text-white disabled:opacity-40" style={{ background: "#d97706" }}>Set</button>
             </div>
           )}
-          <div className="text-xs mt-2" style={{ color: scaleInput._px ? "#7CFFCB" : "rgba(253,230,138,0.6)" }}>
-            {scaleInput._px ? `✓ line measured (${Math.round(scaleInput._px)}px) — now fill in the value and press Set` : "First drag a line on the plan above."}
+          <div className="text-xs mt-2" style={{ color: scaleInput._px ? "#7CFFCB" : "rgba(253,230,138,0.8)" }}>
+            {scaleInput._px ? "✓ Line measured. Now fill in the value and press Set." : "First drag a line on the plan below."}
           </div>
         </div>
       )}
+
+      <div ref={wrapRef} className="rounded-xl overflow-hidden relative" style={{ border: "1px solid rgba(255,255,255,0.12)", touchAction: "none" }}>
+        <canvas ref={canvasRef} aria-label="Floor plan editor"
+          onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+          onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
+          style={{ display: "block", cursor: tool === "move" ? "grab" : "crosshair" }} />
+
+        {/* the selected piece: pinned over the top of the drawing so it's always on screen */}
+        {sel && (
+          <div className="absolute top-2 left-2 right-2 rounded-lg px-3 py-2 flex flex-wrap items-center gap-2 text-sm"
+            style={{ background: "rgba(16,13,38,0.92)", border: "1px solid rgba(124,255,203,0.35)" }}>
+            <span style={{ color: "#7CFFCB" }}>
+              {sel.kind === "furn" ? prettyType(sel.o.type) : sel.kind === "stair" ? "Stairs" : sel.kind === "room" ? "Room name"
+                : sel.kind === "wall" ? ((sel.o.conf ?? 1) < 0.6 ? "Wall (unsure)" : "Wall") : (sel.o.type === "door" ? "Door" : "Window")}
+            </span>
+            {sel.kind === "wall" && (
+              <span className="text-slate-300">{lenLabel(Math.hypot(sel.o.x2 - sel.o.x1, sel.o.y2 - sel.o.y1)) ?? "set the real size to see its length"}</span>
+            )}
+            {sel.kind === "wall" && (sel.o.conf ?? 1) < 0.6 && (
+              <button onClick={() => { onPushHistory?.(); setWalls((a) => a.map((w) => w.id === sel.o.id ? { ...w, conf: 1 } : w)); }}
+                className="min-h-9 px-2.5 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.18)", border: "1px solid rgba(124,255,203,0.45)" }}>looks right ✓</button>
+            )}
+            {sel.kind === "furn" && (
+              <select aria-label="What this is" value={sel.o.type} onChange={(e) => { onPushHistory?.(); setBox("furn", sel.o.id, { type: e.target.value }); }}
+                className="min-h-9 px-2 rounded bg-black/30 border border-white/15 text-white">
+                {FURN_TYPE_LIST.map((k) => <option key={k} value={k}>{prettyType(k)}</option>)}
+              </select>
+            )}
+            {(sel.kind === "furn" || sel.kind === "stair") && scale && (
+              <span className="text-slate-300 text-xs">{lenLabel(sel.o.w)} × {lenLabel(sel.o.h)}</span>
+            )}
+            {sel.kind === "opening" && (
+              <>
+                <button onClick={() => { onPushHistory?.(); setOpeningWidth(sel.o.id, sel.o.w - (inch ? 2 * inch : sel.o.w * 0.1)); }} aria-label="Narrower"
+                  className="min-w-9 min-h-9 rounded text-white" style={btn}>−</button>
+                <span className="text-slate-200 text-xs min-w-[4.5rem] text-center">{inch ? `${Math.round(sel.o.w / inch)}" wide` : "width"}</span>
+                <button onClick={() => { onPushHistory?.(); setOpeningWidth(sel.o.id, sel.o.w + (inch ? 2 * inch : sel.o.w * 0.1)); }} aria-label="Wider"
+                  className="min-w-9 min-h-9 rounded text-white" style={btn}>+</button>
+                <button onClick={() => { onPushHistory?.(); setOpenings((o) => o.map((q) => q.id === sel.o.id ? { ...q, type: q.type === "door" ? "window" : "door" } : q)); }}
+                  className="min-h-9 px-2.5 rounded text-xs text-white" style={btn}>make it a {sel.o.type === "door" ? "window" : "door"}</button>
+              </>
+            )}
+            {sel.kind === "room" && (
+              <input aria-label="Room name" value={sel.o.name} maxLength={40}
+                onFocus={() => onPushHistory?.()}
+                onChange={(e) => { const v = e.target.value; setRooms((a) => a.map((r) => r.id === sel.o.id ? { ...r, name: v } : r)); }}
+                onBlur={(e) => { if (!e.target.value.trim()) setRooms((a) => a.filter((r) => r.id !== sel.o.id)); }}
+                className="min-h-9 px-2 rounded bg-black/30 border border-white/15 text-white w-40" />
+            )}
+            <span className="text-slate-400 text-xs hidden sm:inline">
+              {sel.kind === "wall" ? "drag to move · drag an end to reshape" : sel.kind === "opening" ? "drag it along a wall" : sel.kind === "room" ? "drag to move it" : "drag to move · drag a corner to resize"}
+            </span>
+            <span className="flex-1" />
+            <button onClick={deleteSelected} className="min-h-9 px-3 rounded text-white text-xs font-medium" style={{ background: "#b4444e" }}>Delete</button>
+            <button onClick={() => setSelected(null)} aria-label="Done" className="min-h-9 px-2.5 rounded text-xs text-slate-200" style={btn}>Done</button>
+          </div>
+        )}
+
+        {/* zoom controls (pinch to zoom + two-finger drag to pan also work) */}
+        <div className="absolute bottom-3 right-3 flex flex-col gap-1.5 select-none">
+          {[["+", () => applyZoom(1.3), "Zoom in"], ["⤢", fitView, "Fit to screen"], ["−", () => applyZoom(1 / 1.3), "Zoom out"]].map(([label, fn, name]) => (
+            <button key={name} onClick={fn} title={name} aria-label={name}
+              className="w-9 h-9 pointer-coarse:w-11 pointer-coarse:h-11 rounded-lg text-lg font-medium text-white flex items-center justify-center"
+              style={{ background: "rgba(20,16,46,0.85)", border: "1px solid rgba(255,255,255,0.18)" }}>{label}</button>
+          ))}
+        </div>
+      </div>
 
       {/* status bar with a color legend so the dots/colors are self-explanatory */}
       <div className="mt-4 flex flex-wrap items-center gap-3 text-sm">
@@ -1280,7 +1495,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
             ...(stairs.length ? [{ label: "stairs", n: stairs.length, color: "#fb923c", shape: "box" }] : []),
           ].map((it) => (
             <span key={it.label} className="flex items-center gap-1.5 text-slate-300">
-              <span style={{
+              <span aria-hidden="true" style={{
                 display: "inline-block",
                 width: it.shape === "line" ? 14 : 11, height: it.shape === "line" ? 4 : 11,
                 borderRadius: it.shape === "dot" ? "50%" : it.shape === "line" ? 2 : 3,
@@ -1294,26 +1509,55 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         {scale ? (
           <span style={{ color: "#7CFFCB" }}>Real size set{dims ? ` · about ${dims}` : ""}</span>
         ) : (
-          <span style={{ color: "#fbbf24" }}>Tap “Set scale” to tell us the real size (otherwise it's a guess)</span>
+          <span style={{ color: "#fbbf24" }}>Tap “Set real size” so lengths are right (otherwise it's a guess)</span>
         )}
-        {uncertainCount > 0 && (
-          <span style={{ color: "#fbbf24" }}>⚠ {uncertainCount} wall{uncertainCount > 1 ? "s" : ""} {uncertainCount > 1 ? "look" : "looks"} uncertain (orange &amp; dashed) — tap to check</span>
-        )}
-        <label className="text-slate-400 flex items-center gap-2 ml-auto">ceiling
-          <input type="range" min="7" max="11" step="0.5" value={ceiling} onChange={(e) => setCeiling(parseFloat(e.target.value))} />
-          <span className="text-slate-300 w-12">{ftIn(ceiling)}</span>
+        <div role="radiogroup" aria-label="Units" className="flex rounded-lg overflow-hidden ml-auto" style={btn}>
+          {[["ft", "ft"], ["m", "m"]].map(([k, label]) => (
+            <button key={k} role="radio" aria-checked={units === k} onClick={() => setUnits?.(k)}
+              className="min-h-9 px-3 text-xs" style={{ background: units === k ? "#6d5ae6" : "transparent", color: units === k ? "#fff" : "#cbd5e1" }}>{label}</button>
+          ))}
+        </div>
+        <label className="text-slate-300 flex items-center gap-2">ceiling
+          <input type="range" min="7" max="11" step="0.5" value={ceiling} onChange={(e) => setCeiling(parseFloat(e.target.value))} aria-label="Ceiling height" />
+          <span className="text-slate-200 w-14">{fmtLen(ceiling, units)}</span>
         </label>
       </div>
 
+      {/* Issues: worth a look before walking */}
+      <div className="mt-3">
+        <button onClick={() => setShowIssues((v) => !v)} aria-expanded={showIssues}
+          className="min-h-10 px-3 rounded-lg text-sm flex items-center gap-2"
+          style={{ ...btn, color: issues.length ? "#fde68a" : "#7CFFCB" }}>
+          {issues.length ? `⚠ ${issues.length} thing${issues.length > 1 ? "s" : ""} to check` : "✓ Nothing to check"}
+          {issues.length > 0 && <span className="text-slate-400 text-xs">{showIssues ? "hide" : "show"}</span>}
+        </button>
+        {showIssues && issues.length > 0 && (
+          <ul className="mt-2 rounded-lg overflow-hidden" style={{ border: "1px solid rgba(251,191,36,0.3)" }}>
+            {issues.slice(0, 20).map((it) => (
+              <li key={it.key} className="border-b border-white/5 last:border-b-0">
+                <button onClick={() => openIssue(it)} className="w-full text-left min-h-11 px-3 py-2 text-sm text-amber-100 hover:bg-white/5">
+                  {it.text} <span className="text-slate-400 text-xs">{it.tool ? "→ fix it" : "→ show me"}</span>
+                </button>
+              </li>
+            ))}
+            {issues.length > 20 && <li className="px-3 py-2 text-xs text-slate-400">and {issues.length - 20} more</li>}
+          </ul>
+        )}
+      </div>
+
       <div className="mt-5 flex gap-3">
-        <button onClick={onBack} className="px-4 py-2 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>← Back</button>
+        <button onClick={onBack} className="min-h-11 px-4 rounded-lg text-sm text-slate-300" style={btn}>← Back</button>
         <button onClick={onWalk} disabled={walls.length < 3}
-          className="px-5 py-2 rounded-lg text-sm font-semibold text-white ml-auto"
-          style={{ background: walls.length < 3 ? "rgba(255,255,255,0.1)" : "#6d5ae6" }}>
-          Build & walk it →
+          className="min-h-11 px-5 rounded-lg text-sm font-semibold text-white ml-auto disabled:opacity-40"
+          style={{ background: "#6d5ae6" }}>
+          Build &amp; walk it →
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-2">Tip: when adding or reshaping a wall, its end snaps onto a nearby corner (a ring shows the join). Pinch to zoom, twist two fingers to spin the view, and use ↶ Undo (or Ctrl/Cmd+Z) to take back the last change.</p>
+      <p className="text-xs text-slate-400 mt-2">
+        {IS_TOUCH
+          ? "Tip: pinch to zoom, twist two fingers to turn the view. Wall ends snap onto nearby corners."
+          : "Tip: Ctrl/Cmd + scroll (or pinch on a trackpad) to zoom, Shift + scroll to turn the view. Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z redoes, Delete removes what's selected."}
+      </p>
     </div>
   );
 }

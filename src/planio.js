@@ -4,7 +4,7 @@
 // passes through a cleaner here, so bad numbers or huge lists can never reach the editor or
 // the 3D walk. Also: plan files, share links and the 2D plan picture.
 
-import { nid, FURN_TYPE_LIST, CEILING_FT_DEFAULT, FT_TO_M, ftIn } from "./shared.js";
+import { nid, FURN_TYPE_LIST, CEILING_FT_DEFAULT, FT_TO_M, ftIn, pointSeg } from "./shared.js";
 
 const LIMITS = { walls: 400, openings: 200, furniture: 200, stairs: 20, rooms: 60 };
 
@@ -85,6 +85,16 @@ export function cleanSavedPlan(p) {
   const ceiling = clampN(p.ceiling, 7, 11, CEILING_FT_DEFAULT);
   return { img, walls, openings, furniture, stairs, rooms, scale, ceiling, tidy: p.tidy !== false };
 }
+
+// ---------- downloads ----------
+export function download(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+export const fileSafe = (s) => (String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "my-plan");
 
 // ---------- plan files ----------
 const FILE_TAG = "blueprint-walker-plan";
@@ -183,10 +193,28 @@ export function renderPlanImage(plan, { units = "ft", title = "" } = {}) {
   const wallPx = plan.scale ? (0.12 * plan.scale.pixelsPerUnit) / (plan.scale.unit === "ft" ? FT_TO_M : 1) : 6;
   x.strokeStyle = "#1d1b2e"; x.lineCap = "square"; x.lineWidth = Math.max(5, Math.min(14, wallPx * s));
   walls.forEach((w) => { const [a, b] = P(w.x1, w.y1), [cc, d] = P(w.x2, w.y2); x.beginPath(); x.moveTo(a, b); x.lineTo(cc, d); x.stroke(); });
+  // doors: a gap in the wall with a quarter-circle swing; windows: a thin pane set into the wall
+  const wallLW = x.lineWidth;
   (plan.openings || []).forEach((o) => {
-    const [cx, cy] = P(o.x, o.y), r = Math.max(6, (o.w * s) / 2);
-    x.fillStyle = o.type === "door" ? "#ffffff" : "#d9efff"; x.strokeStyle = o.type === "door" ? "#2f9e6e" : "#2b7fc0"; x.lineWidth = 3;
-    x.beginPath(); x.arc(cx, cy, Math.min(r, 22), 0, Math.PI * 2); x.fill(); x.stroke();
+    let best = null;
+    walls.forEach((w) => { const d = pointSeg(o.x, o.y, w.x1, w.y1, w.x2, w.y2); if (!best || d.dist < best.dist) best = { ...d, w }; });
+    const [cx, cy] = P(o.x, o.y), half = Math.max(8, (o.w * s) / 2);
+    let ux = 1, uy = 0;
+    if (best) { const L = Math.hypot(best.w.x2 - best.w.x1, best.w.y2 - best.w.y1) || 1; ux = (best.w.x2 - best.w.x1) / L; uy = (best.w.y2 - best.w.y1) / L; }
+    const ax = cx - ux * half, ay = cy - uy * half, bx = cx + ux * half, by = cy + uy * half;
+    x.save(); x.lineCap = "butt";
+    x.strokeStyle = "#ffffff"; x.lineWidth = wallLW + 6;                                  // cut the gap
+    x.beginPath(); x.moveTo(ax, ay); x.lineTo(bx, by); x.stroke();
+    if (o.type === "door") {
+      x.strokeStyle = "#2f9e6e"; x.lineWidth = 2.5;
+      const a0 = Math.atan2(uy, ux);
+      x.beginPath(); x.moveTo(ax, ay); x.lineTo(ax - uy * half * 2, ay + ux * half * 2); x.stroke();   // the door leaf
+      x.setLineDash([6, 5]); x.beginPath(); x.arc(ax, ay, half * 2, a0, a0 + Math.PI / 2); x.stroke(); x.setLineDash([]);
+    } else {
+      x.strokeStyle = "#2b7fc0"; x.lineWidth = 3;
+      [-4, 4].forEach((k) => { x.beginPath(); x.moveTo(ax - uy * k, ay + ux * k); x.lineTo(bx - uy * k, by + ux * k); x.stroke(); });
+    }
+    x.restore();
   });
   x.textAlign = "center"; x.textBaseline = "middle";
   (plan.rooms || []).forEach((r) => {
