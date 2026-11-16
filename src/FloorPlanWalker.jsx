@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo, Suspense, laz
 
 // The 3D walk (and Three.js) loads only when someone presses "Build & walk it".
 const Walk = lazy(() => import("./Walk.jsx"));
-import { CEILING_FT_DEFAULT, DOOR_W_M, FT_TO_M, FURN_TYPE_LIST, MAX_DIM, WIN_W_M, boxCorners, boxInside, ftIn, nid, pointSeg } from "./shared.js";
+import { IS_TOUCH, CEILING_FT_DEFAULT, DOOR_W_M, FT_TO_M, FURN_TYPE_LIST, MAX_DIM, WIN_W_M, boxCorners, boxInside, ftIn, nid, pointSeg } from "./shared.js";
 import { planFromModel, cleanSavedPlan, planFileBlob, readPlanFile, planToHash, planFromHash, fmtLen, pxToFeet, renderPlanImage } from "./planio.js";
 import { traceWithClaude, TRACE_ERRORS, getKey, saveKey, forgetKey, keyIsRemembered, looksLikeKey } from "./vision.js";
 
@@ -459,24 +459,29 @@ function Header({ stage, onHelp }) {
   const steps = [["upload", "Add plan"], ["analyzing", "Reading"], ["editor", "Fix it up"], ["walk", "Walk it"]];
   const idx = { upload: 0, analyzing: 1, editor: 2, walk: 3 }[stage];
   return (
-    <div className="flex items-center justify-between px-5 py-3 border-b border-white/10 backdrop-blur"
+    <div className="flex items-center justify-between gap-3 px-4 sm:px-5 py-2.5 border-b border-white/10 backdrop-blur"
       style={{ background: "rgba(255,255,255,0.03)" }}>
-      <div className="flex items-baseline gap-3">
-        <span className="text-base font-semibold tracking-tight" style={{ color: "#c7b6ff" }}>Blueprint Walker</span>
-        <span className="text-xs text-slate-400 hidden sm:inline">your floor plan, as a space you can walk through</span>
+      <div className="flex items-baseline gap-3 min-w-0">
+        <span className="text-base font-semibold tracking-tight whitespace-nowrap" style={{ color: "#c7b6ff" }}>Blueprint Walker</span>
+        <span className="text-xs text-slate-400 hidden lg:inline">your floor plan, as a space you can walk through</span>
       </div>
       <div className="flex items-center gap-2">
-        {steps.map(([k, label], i) => (
-          <div key={k} className="flex items-center gap-2">
-            <span className={"text-[11px] px-2 py-1 rounded-full " + (i <= idx ? "text-white" : "text-slate-500")}
-              style={{ background: i <= idx ? "rgba(124,99,255,0.25)" : "transparent", border: "1px solid " + (i <= idx ? "rgba(124,99,255,0.5)" : "rgba(255,255,255,0.08)") }}>
-              {i + 1}. {label}
-            </span>
-            {i < steps.length - 1 && <span className="text-slate-600 text-xs">→</span>}
-          </div>
-        ))}
+        {/* phones: just the current step */}
+        <span className="md:hidden text-xs text-slate-300 whitespace-nowrap">Step {idx + 1} of 4 · {steps[idx][1]}</span>
+        {/* wider screens: all four steps */}
+        <ol className="hidden md:flex items-center gap-2" aria-label="Steps">
+          {steps.map(([k, label], i) => (
+            <li key={k} className="flex items-center gap-2" aria-current={i === idx ? "step" : undefined}>
+              <span className={"text-[11px] px-2 py-1 rounded-full whitespace-nowrap " + (i <= idx ? "text-white" : "text-slate-400")}
+                style={{ background: i <= idx ? "rgba(124,99,255,0.25)" : "transparent", border: "1px solid " + (i <= idx ? "rgba(124,99,255,0.5)" : "rgba(255,255,255,0.08)") }}>
+                {i + 1}. {label}
+              </span>
+              {i < steps.length - 1 && <span className="text-slate-500 text-xs" aria-hidden="true">→</span>}
+            </li>
+          ))}
+        </ol>
         <button onClick={onHelp} title="How it works" aria-label="How it works"
-          className="ml-1 w-7 h-7 rounded-full text-sm text-slate-200 flex items-center justify-center shrink-0"
+          className="ml-1 w-9 h-9 pointer-coarse:w-11 pointer-coarse:h-11 rounded-full text-sm text-slate-200 flex items-center justify-center shrink-0"
           style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.15)" }}>?</button>
       </div>
     </div>
@@ -504,12 +509,12 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
             className="rounded-2xl p-10 text-center transition"
             style={{ border: "1.5px dashed " + (drag ? "#7c63ff" : "rgba(255,255,255,0.15)"), background: drag ? "rgba(124,99,255,0.08)" : "rgba(255,255,255,0.02)" }}
           >
-            <div className="text-slate-300 mb-4 text-sm">Drag a plan here, or</div>
+            <div className="text-slate-300 mb-4 text-sm">{IS_TOUCH ? "Add your plan:" : "Drag a plan here, or"}</div>
             <div className="flex flex-wrap gap-3 justify-center">
-              <button onClick={() => fileRef.current?.click()} className="px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "#6d5ae6" }}>Choose file</button>
-              <button onClick={() => camRef.current?.click()} className="px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>Take a photo</button>
-              <button onClick={onBlank} className="px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(124,255,203,0.14)", border: "1px solid rgba(124,255,203,0.4)" }}>Draw a new plan</button>
-              <button onClick={onSample} className="px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Try a sample</button>
+              <button onClick={() => fileRef.current?.click()} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "#6d5ae6" }}>Choose file</button>
+              {IS_TOUCH && <button onClick={() => camRef.current?.click()} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.12)" }}>Take a photo</button>}
+              <button onClick={onBlank} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-white" style={{ background: "rgba(124,255,203,0.14)", border: "1px solid rgba(124,255,203,0.4)" }}>Draw a new plan</button>
+              <button onClick={onSample} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-slate-200" style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.12)" }}>Try a sample</button>
             </div>
             <div className="text-slate-500 text-xs mt-4">“Draw a new plan” gives you a blank grid where 1 square = 1 foot — no photo needed.</div>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
@@ -529,11 +534,11 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
                         <div className="text-sm text-slate-100 truncate">{p.name}</div>
                         <div className="text-[11px] text-slate-500">{new Date(p.savedAt).toLocaleDateString()}{p.photoDropped ? " · no photo" : ""}</div>
                       </div>
-                      <div className="flex items-center gap-1.5">
-                        <button onClick={() => onOpenPlan?.(p, false)} className="flex-1 px-2 py-1 rounded text-xs font-medium text-white" style={{ background: "#6d5ae6" }}>Open</button>
-                        <button onClick={() => onOpenPlan?.(p, true)} title="Walk it now" className="px-2 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.16)", border: "1px solid rgba(124,255,203,0.4)" }}>Walk</button>
-                        <button onClick={async () => { const n = await ask({ title: "Rename this plan", input: p.name, confirmLabel: "Rename" }); if (n) onRenamePlan?.(p.id, n); }} title="Rename" className="px-2 py-1 rounded text-xs text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>✎</button>
-                        <button onClick={async () => { if (await ask({ title: `Delete “${p.name}”?`, body: "This can't be undone.", confirmLabel: "Delete", danger: true })) onDeletePlan?.(p.id); }} title="Delete" className="px-2 py-1 rounded text-xs" style={{ background: "rgba(180,68,78,0.18)", border: "1px solid rgba(180,68,78,0.4)", color: "#ffb4ba" }}>🗑</button>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button onClick={() => onOpenPlan?.(p, false)} className="flex-1 min-h-9 pointer-coarse:min-h-11 px-2 py-1 rounded text-xs font-medium text-white" style={{ background: "#6d5ae6" }}>Open</button>
+                        <button onClick={() => onOpenPlan?.(p, true)} title="Walk it now" className="min-h-9 pointer-coarse:min-h-11 px-2 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.16)", border: "1px solid rgba(124,255,203,0.4)" }}>Walk</button>
+                        <button onClick={async () => { const n = await ask({ title: "Rename this plan", input: p.name, confirmLabel: "Rename" }); if (n) onRenamePlan?.(p.id, n); }} title="Rename" aria-label="Rename plan" className="min-h-9 min-w-9 pointer-coarse:min-h-11 pointer-coarse:min-w-11 px-2 py-1 rounded text-xs text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>✎</button>
+                        <button onClick={async () => { if (await ask({ title: `Delete “${p.name}”?`, body: "This can't be undone.", confirmLabel: "Delete", danger: true })) onDeletePlan?.(p.id); }} title="Delete" aria-label="Delete plan" className="min-h-9 min-w-9 pointer-coarse:min-h-11 pointer-coarse:min-w-11 px-2 py-1 rounded text-xs" style={{ background: "rgba(180,68,78,0.18)", border: "1px solid rgba(180,68,78,0.4)", color: "#ffb4ba" }}>🗑</button>
                       </div>
                     </div>
                   </div>
@@ -620,7 +625,7 @@ function KeyBox({ onChange }) {
               placeholder="sk-ant-…" autoComplete="off" spellCheck={false}
               className="flex-1 min-w-0 px-3 py-2 rounded-lg text-sm text-slate-100 outline-none"
               style={{ background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.15)" }} />
-            <button onClick={save} disabled={!draft.trim()} className="px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-40" style={{ background: "#6d5ae6" }}>Save</button>
+            <button onClick={save} disabled={!draft.trim()} className="pointer-coarse:min-h-11 px-4 py-2 rounded-lg text-sm font-medium text-white disabled:opacity-40" style={{ background: "#6d5ae6" }}>Save</button>
           </div>
           {warn && <div role="alert" className="text-xs mt-1.5" style={{ color: "#fde68a" }}>{warn}</div>}
           <label className="flex items-center gap-2 text-xs text-slate-300 mt-2.5">
@@ -652,6 +657,7 @@ function Analyzing() {
 // ================= 2D EDITOR =================
 function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, openings, setOpenings, furniture = [], setFurniture, stairs = [], setStairs, rooms = [], setRooms, scale, setScale, ceiling, setCeiling, error, onRetry, onRotate, savedName = "", onSave, saveStatus = "", onUndo, canUndo = false, onPushHistory, onWalk, onBack }) {
   const canvasRef = useRef(null);
+  const HIT = IS_TOUCH ? 2 : 1;                       // fingers are bigger than mouse pointers
   const [saving, setSaving] = useState(false);          // inline "name this plan" panel open?
   const [nameDraft, setNameDraft] = useState(savedName); // editable name in the Save panel
   const wrapRef = useRef(null);
@@ -935,7 +941,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     const list = boxList();
     if (selected) {
       const f = list.find((b) => b.kind === selected.kind && b.o.id === selected.id);
-      if (f) for (const cn of boxCorners(f.o)) { const p = toScreen(cn.x, cn.y); if (Math.hypot(p.x - sx, p.y - sy) < 11) return { ...f, corner: cn }; }
+      if (f) for (const cn of boxCorners(f.o)) { const p = toScreen(cn.x, cn.y); if (Math.hypot(p.x - sx, p.y - sy) < 11 * HIT) return { ...f, corner: cn }; }
     }
     for (let i = list.length - 1; i >= 0; i--) if (boxInside(px, py, list[i].o)) return list[i];
     return null;
@@ -956,7 +962,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       return;
     }
     const { sx, sy, x, y } = getXY(e);
-    const hitR = 10 / tf.current.s;
+    const hitR = (10 * HIT) / tf.current.s;
 
     if (tool === "scale") { setScaleDraft({ x1: x, y1: y, x2: x, y2: y }); drag.current = { type: "scale" }; return; }
     if (tool === "wall") { const sp = snapEndpoint(x, y); drag.current = { type: "newwall", x1: sp.x, y1: sp.y, x2: sp.x, y2: sp.y, snapStart: sp.snapped, snapEnd: sp.snapped }; return; }
@@ -972,7 +978,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
     }
     if (tool === "erase") {
       // opening first
-      const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 10; });
+      const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 10 * HIT; });
       if (oh) { onPushHistory?.(); setOpenings((o) => o.filter((q) => q.id !== oh.id)); return; }
       const bb = hitBox(x, y, sx, sy); // furniture / stairs
       if (bb) { onPushHistory?.(); delBox(bb.kind, bb.o.id); if (selected?.id === bb.o.id) setSelected(null); return; }
@@ -993,15 +999,15 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       for (const end of [1, 2]) {
         const ex = end === 1 ? w.x1 : w.x2, ey = end === 1 ? w.y1 : w.y2;
         const p = toScreen(ex, ey);
-        if (Math.hypot(p.x - sx, p.y - sy) < 9) { setSelected({ kind: "wall", id: w.id }); drag.current = { type: "endpoint", id: w.id, end }; return; }
+        if (Math.hypot(p.x - sx, p.y - sy) < 9 * HIT) { setSelected({ kind: "wall", id: w.id }); drag.current = { type: "endpoint", id: w.id, end }; return; }
       }
     }
-    const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 9; });
+    const oh = openings.find((o) => { const p = toScreen(o.x, o.y); return Math.hypot(p.x - sx, p.y - sy) < 9 * HIT; });
     if (oh) { setSelected({ kind: "opening", id: oh.id }); drag.current = { type: "opening", id: oh.id }; return; }
     if (bh) { setSelected({ kind: bh.kind, id: bh.o.id }); drag.current = { type: "boxmove", kind: bh.kind, id: bh.o.id, gx: bh.o.x - x, gy: bh.o.y - y }; return; }
     // tap on a wall line (away from its ends): select it and drag the whole wall
     const nw = nearestWall(x, y);
-    if (nw && nw.dist < 12 / tf.current.s) {
+    if (nw && nw.dist < (12 * HIT) / tf.current.s) {
       const w = nw.w;
       setSelected({ kind: "wall", id: w.id });
       drag.current = { type: "wallmove", id: w.id, gx1: w.x1 - x, gy1: w.y1 - y, gx2: w.x2 - x, gy2: w.y2 - y };
@@ -1117,23 +1123,23 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       <div className="flex flex-wrap items-center gap-2 mb-3">
         {tools.map(([k, label]) => (
           <button key={k} onClick={() => { setTool(k); setSelected(null); if (k === "scale") setScaleDraft(null); }}
-            className="px-3 py-1.5 rounded-lg text-sm"
+            className="pointer-coarse:min-h-11 px-3 py-1.5 rounded-lg text-sm"
             style={{ background: tool === k ? "#6d5ae6" : "rgba(255,255,255,0.06)", border: "1px solid " + (tool === k ? "#8b78ff" : "rgba(255,255,255,0.12)"), color: tool === k ? "#fff" : "#cbd5e1" }}>
             {label}
           </button>
         ))}
         <button onClick={() => onUndo?.()} disabled={!canUndo} title="Undo last change (Ctrl/Cmd+Z)"
-          className="px-2.5 py-1.5 rounded-lg text-sm flex items-center gap-1"
+          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm flex items-center gap-1"
           style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", color: canUndo ? "#cbd5e1" : "#64748b", opacity: canUndo ? 1 : 0.5, cursor: canUndo ? "pointer" : "default" }}>
           ↶ Undo
         </button>
         <div className="flex-1" />
         <button onClick={() => { setNameDraft(savedName || ""); setSaving(true); }} title="Save this plan to come back to later"
-          className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
+          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
           💾 Save
         </button>
         <button onClick={() => { onPushHistory?.(); onRotate(); }} title="Rotate the whole plan 90° (drag with two fingers to free-rotate the view)"
-          className="px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
+          className="pointer-coarse:min-h-11 px-2.5 py-1.5 rounded-lg text-sm text-slate-200 flex items-center gap-1" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>
           ↻ Rotate 90°
         </button>
         <label className="text-xs text-slate-400 flex items-center gap-1 select-none cursor-pointer">
@@ -1167,7 +1173,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         <div className="absolute bottom-3 right-3 flex flex-col gap-1.5 select-none">
           {[["+", () => applyZoom(1.3)], ["⤢", fitView], ["−", () => applyZoom(1 / 1.3)]].map(([label, fn], i) => (
             <button key={i} onClick={fn} title={label === "⤢" ? "Fit to screen" : label === "+" ? "Zoom in" : "Zoom out"}
-              className="w-9 h-9 rounded-lg text-lg font-medium text-white flex items-center justify-center"
+              aria-label={label === "⤢" ? "Fit to screen" : label === "+" ? "Zoom in" : "Zoom out"} className="w-9 h-9 pointer-coarse:w-11 pointer-coarse:h-11 rounded-lg text-lg font-medium text-white flex items-center justify-center"
               style={{ background: "rgba(20,16,46,0.85)", border: "1px solid rgba(255,255,255,0.18)" }}>{label}</button>
           ))}
         </div>

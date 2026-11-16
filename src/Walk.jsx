@@ -1,14 +1,33 @@
 import React, { useState, useRef, useEffect } from "react";
 import * as THREE from "three";
-import { DOOR_TOP_M, EYE_M, FT_TO_M, FURN_3D, WALL_T_M, WIN_SILL_M, WIN_TOP_M, pointSeg } from "./shared.js";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { DOOR_TOP_M, EYE_M, FT_TO_M, FURN_3D, WALL_T_M, WIN_SILL_M, WIN_TOP_M, pointSeg, IS_TOUCH } from "./shared.js";
 
 // ================= 3D WALK =================
+// Three ways to look at the plan:
+//   walk      — first person, with collision (WASD + mouse, or two touch joysticks)
+//   dollhouse — the whole home from above at an angle, ceiling off (drag to turn, scroll/pinch to zoom)
+//   top       — straight down, like the plan but in 3D
+const VIEWS = [["walk", "Walk"], ["dollhouse", "Dollhouse"], ["top", "Top"]];
+
+// do segments p1→p2 and p3→p4 cross? (x/z plane)
+function crosses(p1x, p1z, p2x, p2z, p3x, p3z, p4x, p4z) {
+  const d = (ax, az, bx, bz, cx, cz) => (bx - ax) * (cz - az) - (bz - az) * (cx - ax);
+  const d1 = d(p3x, p3z, p4x, p4z, p1x, p1z), d2 = d(p3x, p3z, p4x, p4z, p2x, p2z);
+  const d3 = d(p1x, p1z, p2x, p2z, p3x, p3z), d4 = d(p1x, p1z, p2x, p2z, p4x, p4z);
+  return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
+}
+
 export default function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale, ceiling, onExit }) {
   const mountRef = useRef(null);
   const miniRef = useRef(null);
+  const apiRef = useRef({});                 // setView / goTo / photo, filled in by the scene effect
   const [locked, setLocked] = useState(false);
-  const touchMove = useRef({ x: 0, y: 0 }); // left stick → move (read in tick)
-  const lookMove = useRef({ x: 0, y: 0 });  // right stick → look (read in tick)
+  const [view, setView] = useState("walk");
+  const [here, setHere] = useState("");      // name of the room you're standing in
+  const touchMove = useRef({ x: 0, y: 0 });  // left stick → move (read in tick)
+  const lookMove = useRef({ x: 0, y: 0 });   // right stick → look (read in tick)
+  const named = rooms.filter((r) => r.name);
 
   // Lock the page while walking: on mobile a look-drag would otherwise scroll/rubber-band the
   // whole page, sliding the fixed joystick out from under your thumb.
@@ -31,7 +50,7 @@ export default function Walk({ walls, openings, furniture = [], stairs = [], roo
 
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0x0c0a1f, 8, 60);
-    const camera = new THREE.PerspectiveCamera(72, W / H, 0.05, 200);
+    const camera = new THREE.PerspectiveCamera(72, W / H, 0.05, 400);
     camera.rotation.order = "YXZ";
     camera.position.set(0, EYE_M, 0);
 
@@ -163,7 +182,15 @@ export default function Walk({ walls, openings, furniture = [], stairs = [], roo
       const spr = makeLabel(r.name); spr.position.set(wx, 1.85, wz); scene.add(spr);
     });
 
-    // (camera spawn is set after the collision resolver is defined)
+    // ceiling over the footprint, so looking up in the walk shows a ceiling, not the void.
+    // Hidden in the dollhouse and top views.
+    const ceil = new THREE.Mesh(new THREE.PlaneGeometry(fw - 4, fh - 4),
+      new THREE.MeshBasicMaterial({ color: 0x8f89aa, side: THREE.DoubleSide })); // unlit: nothing lights a ceiling from below
+    ceil.rotation.x = Math.PI / 2; ceil.position.y = ceilingM; scene.add(ceil);
+
+    // "you are here" marker for the dollhouse and top views
+    const marker = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.7, 20), new THREE.MeshStandardMaterial({ color: 0x7cffcb, emissive: 0x1d6b55 }));
+    marker.rotation.x = Math.PI; marker.visible = false; scene.add(marker);
 
     // ---- collision resolve (player radius) ----
     const R = 0.26;
@@ -182,85 +209,209 @@ export default function Walk({ walls, openings, furniture = [], stairs = [], roo
       return [x, z];
     }
 
-    // spawn at footprint center, pushed out of any wall it lands on
-    {
-      const [sx0, sz0] = resolve(0, 0);
-      camera.position.set(sx0, EYE_M, sz0);
+    // how far you can see from (x,z) toward angle a, before a wall (capped)
+    const MAXRAY = 30;
+    function rayLen(x, z, a) {
+      const dx = Math.sin(a), dz = Math.cos(a);
+      let best = MAXRAY;
+      for (const s of collide) {
+        const ex = s.bx - s.ax, ez = s.bz - s.az, den = dx * ez - dz * ex;
+        if (Math.abs(den) < 1e-9) continue;
+        const t = ((s.ax - x) * ez - (s.az - z) * ex) / den;      // along the ray
+        const u = ((s.ax - x) * dz - (s.az - z) * dx) / den;      // along the wall
+        if (t > 0.05 && u >= 0 && u <= 1 && t < best) best = t;
+      }
+      return best;
+    }
+    // the most open direction from a point, and how open the spot is overall
+    function openness(x, z) {
+      let total = 0, bestA = 0, bestL = -1;
+      for (let i = 0; i < 24; i++) { const a = (i / 24) * Math.PI * 2, L = rayLen(x, z, a); total += Math.min(L, 8); if (L > bestL) { bestL = L; bestA = a; } }
+      return { total, bestA };
+    }
+    // face direction a (x = sin a, z = cos a); the camera looks down -Z at yaw 0
+    const yawFor = (a) => Math.atan2(-Math.sin(a), -Math.cos(a));
+
+    let yaw = 0, pitch = 0;
+    // stand near the back of the space around (x,z), looking across it toward the most open direction
+    function placeAt(x, z) {
+      const [lx, lz] = resolve(x, z);
+      const a = openness(lx, lz).bestA;
+      const back = Math.max(0, Math.min(2.5, rayLen(lx, lz, a + Math.PI) - 0.5));
+      const [px, pz] = resolve(lx - Math.sin(a) * back, lz - Math.cos(a) * back);
+      camera.position.set(px, EYE_M, pz);
+      yaw = yawFor(a); pitch = -0.08;
+      camera.rotation.set(pitch, yaw, 0, "YXZ");
     }
 
+    // spawn: the roomiest of the room labels (or the middle), facing the longest clear view
+    {
+      const spots = [[0, 0], ...rooms.filter((r) => r.name).map((r) => W2(r.x, r.y))];
+      let best = spots[0], bestT = -1;
+      for (const [x, z] of spots) { const [rx, rz] = resolve(x, z), o = openness(rx, rz); if (o.total > bestT) { bestT = o.total; best = [rx, rz]; } }
+      placeAt(best[0], best[1]);
+    }
+
+    // ---- which room am I in? the nearest label I can see (no wall in between) ----
+    const roomPts = rooms.filter((r) => r.name).map((r) => { const [x, z] = W2(r.x, r.y); return { name: r.name, x, z }; });
+    function currentRoom() {
+      const { x, z } = camera.position;
+      let best = "", bd = 1e9;
+      for (const r of roomPts) {
+        const d = Math.hypot(r.x - x, r.z - z);
+        if (d >= bd) continue;
+        if (collide.some((s) => crosses(x, z, r.x, r.z, s.ax, s.az, s.bx, s.bz))) continue;
+        bd = d; best = r.name;
+      }
+      return best;
+    }
+
+    // ---- views ----
+    const span = Math.max(fw, fh, 6);
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    orbit.enabled = false; orbit.enableDamping = true; orbit.target.set(0, 0, 0);
+    orbit.minDistance = 2; orbit.maxDistance = span * 3;
+    let mode = "walk";
+    const walker = { x: camera.position.x, z: camera.position.z, yaw, pitch };
+    function setMode(m) {
+      if (m === mode) return;
+      if (mode === "walk") Object.assign(walker, { x: camera.position.x, z: camera.position.z, yaw, pitch });
+      mode = m;
+      if (document.pointerLockElement) document.exitPointerLock();
+      const walking = m === "walk";
+      ceil.visible = walking; marker.visible = !walking;
+      scene.traverse((o) => {          // room names: readable from above
+        if (!o.isSprite) return;
+        o.userData.base ||= o.scale.clone();
+        o.scale.copy(o.userData.base).multiplyScalar(walking ? 1 : 2.6);
+      });
+      scene.fog.near = walking ? 8 : 400; scene.fog.far = walking ? 60 : 800;
+      orbit.enabled = !walking;
+      if (walking) {
+        camera.position.set(walker.x, EYE_M, walker.z);
+        yaw = walker.yaw; pitch = walker.pitch;
+        camera.rotation.set(pitch, yaw, 0, "YXZ");
+      } else {
+        marker.position.set(walker.x, ceilingM * 0.5 + 0.35, walker.z);
+        orbit.target.set(0, 0, 0);
+        if (m === "top") {
+          orbit.minPolarAngle = 0; orbit.maxPolarAngle = 0;
+          camera.position.set(0, span * 1.15, 0.001);
+        } else {
+          orbit.minPolarAngle = 0.15; orbit.maxPolarAngle = 1.3;
+          camera.position.set(span * 0.42, span * 0.62, span * 0.58);
+        }
+        orbit.update();
+      }
+      setView(m);
+    }
+
+    // ---- photo of the current view ----
+    function photo() {
+      renderer.render(scene, camera);
+      const url = renderer.domElement.toDataURL("image/png");
+      const a = document.createElement("a");
+      const where = mode === "walk" ? (currentRoom() || "inside") : mode;
+      a.href = url; a.download = `blueprint-walker-${where.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.png`;
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+
+    // ---- jump to a room ----
+    function goTo(name) {
+      const r = roomPts.find((q) => q.name === name);
+      if (!r) return;
+      if (mode !== "walk") setMode("walk");
+      placeAt(r.x, r.z);
+    }
+    apiRef.current = { setMode, photo, goTo };
+
     // ---- input ----
-    let yaw = camera.rotation.y, pitch = 0;
     const keys = {};
-    const onKey = (v) => (e) => { keys[e.code] = v; };
-    const kd = onKey(true), ku = onKey(false);
+    const kd = (e) => {
+      if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+      keys[e.code] = true;
+      if (e.code === "Digit1") setMode("walk");
+      else if (e.code === "Digit2") setMode("dollhouse");
+      else if (e.code === "Digit3") setMode("top");
+      else if (e.code === "KeyP") photo();
+    };
+    const ku = (e) => { keys[e.code] = false; };
     window.addEventListener("keydown", kd); window.addEventListener("keyup", ku);
 
     const onMouse = (e) => {
-      if (document.pointerLockElement !== renderer.domElement) return;
+      if (mode !== "walk" || document.pointerLockElement !== renderer.domElement) return;
       yaw -= e.movementX * 0.0024; pitch -= e.movementY * 0.0024;
       pitch = Math.max(-1.45, Math.min(1.45, pitch));
       camera.rotation.set(pitch, yaw, 0, "YXZ");
     };
     document.addEventListener("mousemove", onMouse);
-    const clickLock = () => renderer.domElement.requestPointerLock();
+    const clickLock = () => { if (mode === "walk" && !IS_TOUCH) renderer.domElement.requestPointerLock?.(); };
     renderer.domElement.addEventListener("click", clickLock);
     const onLockChange = () => setLocked(document.pointerLockElement === renderer.domElement);
     document.addEventListener("pointerlockchange", onLockChange);
 
-    // Touch look is driven by the right joystick (lookMove ref), applied per-frame in tick().
-
     // ---- minimap ----
     const mini = miniRef.current;
     const mctx = mini?.getContext("2d");
+    const MS = 150, MPAD = 10;
+    if (mini) { mini.width = MS; mini.height = MS; }
+    const msc = (MS - MPAD * 2) / Math.max((maxx - minx) * mPerPx, (maxy - miny) * mPerPx, 1);
+    const MP = (x, z) => [MS / 2 + x * msc, MS / 2 + z * msc];
     function minimap() {
       if (!mctx) return;
-      const s = 150, pad = 10; mini.width = s; mini.height = s;
-      mctx.clearRect(0, 0, s, s);
-      mctx.fillStyle = "rgba(12,10,31,0.7)"; mctx.fillRect(0, 0, s, s);
-      const spanX = (maxx - minx) * mPerPx, spanZ = (maxy - miny) * mPerPx;
-      const sc = (s - pad * 2) / Math.max(spanX, spanZ, 1);
-      const ox = s / 2, oz = s / 2;
-      const P = (x, z) => [ox + x * sc, oz + z * sc];
+      mctx.clearRect(0, 0, MS, MS);
+      mctx.fillStyle = "rgba(12,10,31,0.7)"; mctx.fillRect(0, 0, MS, MS);
       mctx.strokeStyle = "#8b78ff"; mctx.lineWidth = 1.5;
-      collide.forEach((c) => { const [x1, y1] = P(c.ax, c.az), [x2, y2] = P(c.bx, c.bz); mctx.beginPath(); mctx.moveTo(x1, y1); mctx.lineTo(x2, y2); mctx.stroke(); });
-      const [pxp, pzp] = P(camera.position.x, camera.position.z);
+      collide.forEach((c) => { const [x1, y1] = MP(c.ax, c.az), [x2, y2] = MP(c.bx, c.bz); mctx.beginPath(); mctx.moveTo(x1, y1); mctx.lineTo(x2, y2); mctx.stroke(); });
+      const px = mode === "walk" ? camera.position.x : walker.x, pz = mode === "walk" ? camera.position.z : walker.z;
+      const py = mode === "walk" ? yaw : walker.yaw;
+      const [pxp, pzp] = MP(px, pz);
       mctx.fillStyle = "#7CFFCB"; mctx.beginPath(); mctx.arc(pxp, pzp, 3.5, 0, 7); mctx.fill();
       mctx.strokeStyle = "#7CFFCB"; mctx.beginPath(); mctx.moveTo(pxp, pzp);
-      mctx.lineTo(pxp + Math.sin(yaw) * -10, pzp + Math.cos(yaw) * -10); mctx.stroke();
+      mctx.lineTo(pxp + Math.sin(py) * -10, pzp + Math.cos(py) * -10); mctx.stroke();
     }
 
     // ---- loop ----
     const up = new THREE.Vector3(0, 1, 0);
     const clock = new THREE.Clock();
-    let raf;
+    let raf, lastRoom = null, roomTimer = 0, miniTimer = 0;
     function tick() {
       raf = requestAnimationFrame(tick);
       const dt = Math.min(0.05, clock.getDelta());
-      const run = keys["ShiftLeft"] || keys["ShiftRight"];
-      const speed = (run ? 5.2 : 2.6);
-      const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
-      const right = new THREE.Vector3().crossVectors(fwd, up).normalize();
-      const mv = new THREE.Vector3();
-      if (keys["KeyW"] || keys["ArrowUp"]) mv.add(fwd);
-      if (keys["KeyS"] || keys["ArrowDown"]) mv.sub(fwd);
-      if (keys["KeyD"] || keys["ArrowRight"]) mv.add(right);
-      if (keys["KeyA"] || keys["ArrowLeft"]) mv.sub(right);
-      mv.add(fwd.clone().multiplyScalar(-touchMove.current.y));
-      mv.add(right.clone().multiplyScalar(touchMove.current.x));
-      if (mv.lengthSq() > 0) {
-        mv.normalize().multiplyScalar(speed * dt);
-        const [nx, nz] = resolve(camera.position.x + mv.x, camera.position.z + mv.z);
-        camera.position.x = nx; camera.position.z = nz;
+      if (mode === "walk") {
+        const run = keys["ShiftLeft"] || keys["ShiftRight"];
+        const speed = (run ? 5.2 : 2.6);
+        const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+        const right = new THREE.Vector3().crossVectors(fwd, up).normalize();
+        const mv = new THREE.Vector3();
+        if (keys["KeyW"] || keys["ArrowUp"]) mv.add(fwd);
+        if (keys["KeyS"] || keys["ArrowDown"]) mv.sub(fwd);
+        if (keys["KeyD"] || keys["ArrowRight"]) mv.add(right);
+        if (keys["KeyA"] || keys["ArrowLeft"]) mv.sub(right);
+        mv.add(fwd.clone().multiplyScalar(-touchMove.current.y));
+        mv.add(right.clone().multiplyScalar(touchMove.current.x));
+        if (mv.lengthSq() > 0) {
+          mv.normalize().multiplyScalar(speed * dt);
+          const [nx, nz] = resolve(camera.position.x + mv.x, camera.position.z + mv.z);
+          camera.position.x = nx; camera.position.z = nz;
+        }
+        camera.position.y = EYE_M;
+        // right joystick → look: stick deflection sets the turn rate (like a console controller)
+        const lk = lookMove.current;
+        if (lk.x || lk.y) {
+          yaw -= lk.x * 2.6 * dt;
+          pitch = Math.max(-1.45, Math.min(1.45, pitch - lk.y * 1.9 * dt));
+          camera.rotation.set(pitch, yaw, 0, "YXZ");
+        }
+        // room name: a few times a second is plenty
+        roomTimer += dt;
+        if (roomTimer > 0.25) { roomTimer = 0; const r = currentRoom(); if (r !== lastRoom) { lastRoom = r; setHere(r); } }
+      } else {
+        orbit.update();
       }
-      camera.position.y = EYE_M;
-      // right joystick → look: stick deflection sets the turn rate (like a console controller)
-      const lk = lookMove.current;
-      if (lk.x || lk.y) {
-        yaw -= lk.x * 2.6 * dt;
-        pitch = Math.max(-1.45, Math.min(1.45, pitch - lk.y * 1.9 * dt));
-        camera.rotation.set(pitch, yaw, 0, "YXZ");
-      }
-      minimap();
+      // the minimap only needs ~15 fps
+      miniTimer += dt;
+      if (miniTimer > 0.066) { miniTimer = 0; minimap(); }
       renderer.render(scene, camera);
     }
     tick();
@@ -279,8 +430,18 @@ export default function Walk({ walls, openings, furniture = [], stairs = [], roo
       window.removeEventListener("resize", onResize);
       renderer.domElement.removeEventListener("click", clickLock);
       if (document.pointerLockElement) document.exitPointerLock();
+      orbit.dispose();
+      // free everything the scene made, and give the WebGL context back to the browser,
+      // so going back and forth between editing and walking can't run phones out of contexts
+      scene.traverse((o) => {
+        o.geometry?.dispose?.();
+        const ms = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
+        ms.forEach((m) => { m.map?.dispose?.(); m.dispose?.(); });
+      });
       renderer.dispose();
+      renderer.forceContextLoss();
       mount.removeChild(renderer.domElement);
+      apiRef.current = {};
     };
   }, [walls, openings, furniture, stairs, rooms, scale, ceiling]);
 
@@ -303,39 +464,79 @@ export default function Walk({ walls, openings, furniture = [], stairs = [], roo
   const onMoveStick = drive(moveBase, moveNub, touchMove);
   const onLookStick = drive(lookBase, lookNub, lookMove);
 
+  const walking = view === "walk";
+  const chip = { background: "rgba(20,16,46,0.82)", border: "1px solid rgba(255,255,255,0.16)" };
+  const hint = !walking
+    ? (IS_TOUCH ? "Drag to turn · pinch to zoom · two fingers to slide" : "Drag to turn · scroll to zoom · right-drag to slide · 1 walk · 2 dollhouse · 3 top")
+    : (IS_TOUCH ? "Left stick walks · right stick looks around" : "Click to look · W A S D walk · Shift run · Esc release · 1 2 3 views · P photo");
+
   return (
-    <div className="relative" style={{ height: "calc(100dvh - 53px)", touchAction: "none", overscrollBehavior: "none" }}>
+    <div className="fixed inset-0 z-40" style={{ background: "#0c0a1f", touchAction: "none", overscrollBehavior: "none" }}>
       <div ref={mountRef} className="absolute inset-0" />
       {/* crosshair */}
-      <div className="absolute left-1/2 top-1/2 pointer-events-none" style={{ transform: "translate(-50%,-50%)", width: 6, height: 6, borderRadius: 3, background: "rgba(255,255,255,0.7)" }} />
-      {/* minimap */}
-      <canvas ref={miniRef} className="absolute top-3 right-3 rounded-lg" style={{ width: 150, height: 150, border: "1px solid rgba(255,255,255,0.15)" }} />
-      {/* enter overlay */}
-      {!locked && (
+      {walking && <div className="absolute left-1/2 top-1/2 pointer-events-none" style={{ transform: "translate(-50%,-50%)", width: 6, height: 6, borderRadius: 3, background: "rgba(255,255,255,0.7)" }} />}
+
+      {/* top-left controls */}
+      <div className="absolute top-3 left-3 right-[132px] sm:right-[172px] flex flex-col items-start gap-2" style={{ top: "calc(env(safe-area-inset-top, 0px) + 12px)" }}>
+        <button onClick={onExit} className="min-h-10 pointer-coarse:min-h-11 px-3 rounded-lg text-sm text-slate-200" style={chip}>← Edit plan</button>
+        <div role="radiogroup" aria-label="View" className="flex rounded-lg overflow-hidden" style={chip}>
+          {VIEWS.map(([k, label]) => (
+            <button key={k} role="radio" aria-checked={view === k} onClick={() => apiRef.current.setMode?.(k)}
+              className="min-h-10 pointer-coarse:min-h-11 px-3 text-sm"
+              style={{ background: view === k ? "#6d5ae6" : "transparent", color: view === k ? "#fff" : "#cbd5e1" }}>{label}</button>
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {named.length > 0 && (
+            <label className="relative">
+              <span className="sr-only">Go to a room</span>
+              <select value="" onChange={(e) => { if (e.target.value) apiRef.current.goTo?.(e.target.value); e.target.blur(); }}
+                className="min-h-10 pointer-coarse:min-h-11 pl-3 pr-8 rounded-lg text-sm text-slate-200 appearance-none" style={chip}>
+                <option value="">Go to a room…</option>
+                {[...new Set(named.map((r) => r.name))].map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none" aria-hidden="true">▾</span>
+            </label>
+          )}
+          <button onClick={() => apiRef.current.photo?.()} title="Save a picture of this view (P)" className="min-h-10 pointer-coarse:min-h-11 px-3 rounded-lg text-sm text-slate-200" style={chip}>📷 Photo</button>
+        </div>
+      </div>
+
+      {/* minimap + where you are */}
+      <div className="absolute right-3 flex flex-col items-end gap-1.5" style={{ top: "calc(env(safe-area-inset-top, 0px) + 12px)" }}>
+        <canvas ref={miniRef} className="rounded-lg w-[110px] h-[110px] sm:w-[150px] sm:h-[150px]" style={{ border: "1px solid rgba(255,255,255,0.15)" }} aria-label="Map of the plan" />
+        {walking && here && <div aria-live="polite" className="px-2 py-1 rounded-md text-xs text-slate-100" style={chip}>You're in: {here}</div>}
+      </div>
+
+      {/* desktop: how to start looking around */}
+      {walking && !locked && !IS_TOUCH && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-6">
-          <div className="px-4 py-2.5 rounded-lg text-sm text-slate-200 text-center" style={{ background: "rgba(20,16,46,0.7)", border: "1px solid rgba(255,255,255,0.15)" }}>
-            <span className="sm:hidden">Left stick to walk · right stick to look around</span>
-            <span className="hidden sm:inline">Click to look around · <b>W A S D</b> move · <b>Shift</b> run · <b>Esc</b> release</span>
+          <div className="px-4 py-2.5 rounded-lg text-sm text-slate-200 text-center" style={chip}>
+            Click to look around · <b>W A S D</b> move · <b>Shift</b> run · <b>Esc</b> release
           </div>
         </div>
       )}
-      {/* exit */}
-      <button onClick={onExit} className="absolute top-3 left-3 px-3 py-1.5 rounded-lg text-sm text-slate-200"
-        style={{ background: "rgba(20,16,46,0.8)", border: "1px solid rgba(255,255,255,0.15)" }}>← Edit plan</button>
-      {/* twin touch joysticks (mobile): left = move, right = look */}
-      <Stick label="move" baseRef={moveBase} nubRef={moveNub} onTouch={onMoveStick} side="left" />
-      <Stick label="look" baseRef={lookBase} nubRef={lookNub} onTouch={onLookStick} side="right" />
+
+      {/* key / gesture hints (desktop walk shows them in the centre box until you click) */}
+      {!(walking && !locked && !IS_TOUCH) && <div className="absolute left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full text-xs text-slate-300 text-center pointer-events-none max-w-[92vw]"
+        style={{ ...chip, bottom: walking && IS_TOUCH ? "calc(env(safe-area-inset-bottom, 0px) + 168px)" : "calc(env(safe-area-inset-bottom, 0px) + 14px)" }}>
+        {hint}
+      </div>}
+
+      {/* twin touch joysticks (any touch screen, walk view only): left = move, right = look */}
+      {walking && IS_TOUCH && <Stick label="move" baseRef={moveBase} nubRef={moveNub} onTouch={onMoveStick} side="left" />}
+      {walking && IS_TOUCH && <Stick label="look" baseRef={lookBase} nubRef={lookNub} onTouch={onLookStick} side="right" />}
     </div>
   );
 }
 
-// One on-screen joystick. Pinned above the home-indicator safe area; mobile only.
+// One on-screen joystick, pinned above the home-indicator safe area.
 function Stick({ label, baseRef, nubRef, onTouch, side }) {
   return (
     <div ref={baseRef}
       onTouchStart={onTouch} onTouchMove={onTouch} onTouchEnd={onTouch} onTouchCancel={onTouch}
-      className={`absolute rounded-full sm:hidden ${side === "left" ? "left-6" : "right-6"}`}
-      style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)", width: 120, height: 120, background: "rgba(124,99,255,0.12)", border: "1px solid rgba(124,99,255,0.4)", touchAction: "none" }}>
+      className={`absolute rounded-full ${side === "left" ? "left-6" : "right-6"}`}
+      style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 28px)", width: 120, height: 120, background: "rgba(124,99,255,0.12)", border: "1px solid rgba(124,99,255,0.4)", touchAction: "none" }}>
       <div ref={nubRef} className="absolute left-1/2 top-1/2 rounded-full" style={{ transform: "translate(-50%,-50%)", width: 46, height: 46, background: "rgba(124,99,255,0.55)" }} />
       <span className="absolute left-1/2 rounded text-[10px] uppercase tracking-wide text-slate-300 pointer-events-none" style={{ transform: "translateX(-50%)", bottom: -18 }}>{label}</span>
     </div>

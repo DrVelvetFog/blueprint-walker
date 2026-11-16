@@ -60,3 +60,8 @@ export function pointSeg(px, py, ax, ay, bx, by) {
 
 let _id = 1;
 export const nid = () => _id++;
+
+// Touch screen (phone, tablet)? Decides joysticks, tap-target sizes and drawing hit areas.
+// Based on the pointer, not the screen width, so a sideways phone or an iPad still counts.
+export const IS_TOUCH = typeof window !== "undefined" &&
+  ((window.matchMedia && window.matchMedia("(pointer: coarse)").matches) || (navigator.maxTouchPoints || 0) > 0);
