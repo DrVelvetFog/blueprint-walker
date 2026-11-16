@@ -1,5 +1,9 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import * as THREE from "three";
+import React, { useState, useRef, useEffect, useCallback, useMemo, Suspense, lazy } from "react";
+
+// The 3D walk (and Three.js) loads only when someone presses "Build & walk it".
+const Walk = lazy(() => import("./Walk.jsx"));
+import { CEILING_FT_DEFAULT, DOOR_W_M, FT_TO_M, FURN_TYPE_LIST, MAX_DIM, WIN_W_M, boxCorners, boxInside, ftIn, nid, pointSeg } from "./shared.js";
+import { planFromModel, cleanSavedPlan, planFileBlob, readPlanFile, planToHash, planFromHash, fmtLen, pxToFeet, renderPlanImage } from "./planio.js";
 import { traceWithClaude, TRACE_ERRORS, getKey, saveKey, forgetKey, keyIsRemembered, looksLikeKey } from "./vision.js";
 
 /*  Blueprint → Walkable 3D  ·  end-to-end pipeline prototype
@@ -10,72 +14,19 @@ import { traceWithClaude, TRACE_ERRORS, getKey, saveKey, forgetKey, keyIsRemembe
 */
 
 // ---------- constants ----------
-const MAX_DIM = 1024;          // downscale source image to this max dimension before vision + editing
-const CEILING_FT_DEFAULT = 8;  // default ceiling height (ft) — she thinks in feet
-const FT_TO_M = 0.3048;
-const IN_TO_M = 0.0254;
-const WALL_T_M = 0.12;          // interior wall thickness (~4.7")
-// Residential door/window standards (inches → m). Doors are 36"×80"; openings get an 80" head.
-// Windows sit on a ~32" sill with the head aligned to the door head at 80". Default ADD widths use
-// a common 32" interior door and 36" window; widths read from a real drawing are kept as-drawn.
-const DOOR_TOP_M = 80 * IN_TO_M;   // door head height (80")
-const WIN_SILL_M = 32 * IN_TO_M;   // window sill height (32")
-const WIN_TOP_M = 80 * IN_TO_M;    // window head height (80", aligned with doors)
-const DOOR_W_M = 32 * IN_TO_M;     // default width when adding a door (32" interior)
-const WIN_W_M = 36 * IN_TO_M;      // default width when adding a window (36" general)
-const EYE_M = 1.6;              // camera eye height (~63")
-
-// Format a length in decimal feet as plain feet-and-inches, e.g. 13.5 -> 13' 6".
-// Rounds to the nearest inch and rolls 12" up to the next foot.
-function ftIn(feet) {
-  if (!isFinite(feet)) return "—";
-  let totalIn = Math.round(feet * 12);
-  const ft = Math.floor(totalIn / 12);
-  const inch = totalIn - ft * 12;
-  return inch ? `${ft}' ${inch}"` : `${ft}'`;
-}
-
-// How each furniture type is drawn as a simple 3D block: height (m) + color.
-const FURN_3D = {
-  bed: { h: 0.55, color: 0x6d7fa6 }, sofa: { h: 0.80, color: 0x5f76a0 }, armchair: { h: 0.85, color: 0x5f76a0 },
-  chair: { h: 0.90, color: 0x7c6f5a }, table: { h: 0.75, color: 0x9b7653 }, coffee_table: { h: 0.42, color: 0x9b7653 },
-  desk: { h: 0.75, color: 0x9b7653 }, dresser: { h: 0.90, color: 0x9b7653 }, nightstand: { h: 0.50, color: 0x9b7653 },
-  wardrobe: { h: 2.00, color: 0x8a6a4a }, bookshelf: { h: 1.80, color: 0x8a6a4a }, tv: { h: 1.10, color: 0x2b2b33 },
-  toilet: { h: 0.42, color: 0xeef2f5 }, tub: { h: 0.52, color: 0xeef2f5 }, shower: { h: 2.00, color: 0xcfe6f5 },
-  sink: { h: 0.85, color: 0xeef2f5 }, counter: { h: 0.90, color: 0xcfc9bb }, stove: { h: 0.90, color: 0x9aa3ad },
-  fridge: { h: 1.80, color: 0x9aa3ad }, rug: { h: 0.02, color: 0x8a5a6a }, other: { h: 0.55, color: 0x8a8597 },
-};
-const FURN_TYPE_LIST = Object.keys(FURN_3D);
-
-// geometry for a furniture/stairs box {x,y,w,h,deg} (deg = clockwise, plan space)
-function boxCorners(o) {
-  const d = ((o.deg || 0) * Math.PI) / 180, c = Math.cos(d), s = Math.sin(d), hw = o.w / 2, hh = o.h / 2;
-  return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) => ({ sx, sy, x: o.x + sx * hw * c - sy * hh * s, y: o.y + sx * hw * s + sy * hh * c }));
-}
-function boxInside(px, py, o) {
-  const d = ((o.deg || 0) * Math.PI) / 180, dx = px - o.x, dy = py - o.y;
-  const lx = dx * Math.cos(d) + dy * Math.sin(d), ly = -dx * Math.sin(d) + dy * Math.cos(d);
-  return Math.abs(lx) <= o.w / 2 && Math.abs(ly) <= o.h / 2;
-}
-
-// ---------- small geometry helpers ----------
-function pointSeg(px, py, ax, ay, bx, by) {
-  const dx = bx - ax, dy = by - ay;
-  const len2 = dx * dx + dy * dy || 1e-9;
-  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
-  t = Math.max(0, Math.min(1, t));
-  const cx = ax + t * dx, cy = ay + t * dy;
-  return { dist: Math.hypot(px - cx, py - cy), t, cx, cy };
-}
-
-let _id = 1;
-const nid = () => _id++;
 
 // ---------- saved plans (localStorage) ----------
 // Client-only persistence so the user can save a plan, leave, and come back to walk it again.
 // Lives in localStorage (no server, no new SaaS). Each entry: { id, name, savedAt, thumb, plan }.
 const PLANS_KEY = "bw_plans";
-function loadPlans() { try { return JSON.parse(localStorage.getItem(PLANS_KEY) || "[]"); } catch { return []; } }
+const FILE_ERROR = "We couldn't open that file. Try a JPG or PNG photo, or take a screenshot of the plan and use that.";
+
+function loadPlans() {
+  try {
+    const v = JSON.parse(localStorage.getItem(PLANS_KEY) || "[]");
+    return Array.isArray(v) ? v.filter((e) => e && typeof e === "object" && e.id && e.plan) : [];
+  } catch { return []; }
+}
 function tryPersist(list) { try { localStorage.setItem(PLANS_KEY, JSON.stringify(list)); return true; } catch { return false; } }
 
 // tiny wall-sketch thumbnail (a few KB) so the "My plans" list is recognisable at a glance,
@@ -155,40 +106,63 @@ export default function FloorPlanWalker() {
   const [currentName, setCurrentName] = useState("");       // its name (prefilled into the Save box)
   const [saveStatus, setSaveStatus] = useState("");         // transient "Saved ✓" / quota message
   const [showIntro, setShowIntro] = useState(() => { try { return !localStorage.getItem("bw_intro_seen"); } catch { return false; } });
+  // in-app dialogs (instead of the browser's own prompt/confirm pop-ups)
+  const [dialog, setDialog] = useState(null);
+  const ask = useCallback((opts) => new Promise((resolve) => setDialog({ ...opts, resolve })), []);
   const closeIntro = () => { try { localStorage.setItem("bw_intro_seen", "1"); } catch {} setShowIntro(false); };
 
   // squared walls used for the 3D build and the editor's "after" preview; raw walls stay editable
   const tidied = useMemo(() => (tidy ? tidyWalls(walls) : walls), [tidy, walls]);
 
-  // ---- undo history ----
+  // ---- undo / redo history ----
   // Each entry snapshots the editable state BEFORE a discrete action. Every update is immutable
   // (new arrays/objects), so we can store references cheaply without deep-copying.
   const historyRef = useRef([]);
+  const redoRef = useRef([]);
   const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const [dirty, setDirty] = useState(false); // unsaved changes since the last save/open
+  const snapshot = () => ({ walls, openings, furniture, stairs, rooms, scale, ceiling });
+  const restore = (s) => {
+    setWalls(s.walls); setOpenings(s.openings); setFurniture(s.furniture);
+    setStairs(s.stairs); setRooms(s.rooms); setScale(s.scale); setCeiling(s.ceiling);
+  };
   const pushHistory = useCallback(() => {
     const h = historyRef.current;
-    h.push({ walls, openings, furniture, stairs, rooms, scale, ceiling });
+    h.push(snapshot());
     if (h.length > 60) h.shift();
-    setCanUndo(true);
-  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]);
+    redoRef.current = [];
+    setCanUndo(true); setCanRedo(false); setDirty(true);
+  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]); // eslint-disable-line react-hooks/exhaustive-deps
   const undo = useCallback(() => {
     const s = historyRef.current.pop();
     if (!s) return;
-    setWalls(s.walls); setOpenings(s.openings); setFurniture(s.furniture);
-    setStairs(s.stairs); setRooms(s.rooms); setScale(s.scale); setCeiling(s.ceiling);
-    setCanUndo(historyRef.current.length > 0);
-  }, []);
-  // Ctrl/Cmd+Z in the editor (ignore while typing in a field)
+    redoRef.current.push(snapshot());
+    restore(s);
+    setCanUndo(historyRef.current.length > 0); setCanRedo(true); setDirty(true);
+  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]); // eslint-disable-line react-hooks/exhaustive-deps
+  const redo = useCallback(() => {
+    const s = redoRef.current.pop();
+    if (!s) return;
+    historyRef.current.push(snapshot());
+    restore(s);
+    setCanUndo(true); setCanRedo(redoRef.current.length > 0); setDirty(true);
+  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]); // eslint-disable-line react-hooks/exhaustive-deps
+  // a fresh or freshly opened plan: nothing to undo, nothing unsaved (refs + setters only, so stable)
+  const resetHistory = () => { historyRef.current = []; redoRef.current = []; setCanUndo(false); setCanRedo(false); setDirty(false); };
+
+  // Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl+Y redo, in the editor (ignored while typing in a field)
   useEffect(() => {
     const onKey = (e) => {
-      if (stage !== "editor" || !(e.metaKey || e.ctrlKey) || e.shiftKey) return;
-      if (e.key !== "z" && e.key !== "Z") return;
+      if (stage !== "editor" || !(e.metaKey || e.ctrlKey)) return;
       if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
-      e.preventDefault(); undo();
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      else if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); redo(); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, stage]);
+  }, [undo, redo, stage]);
 
   // ---- image intake (downscale to a consistent working resolution) ----
   const ingest = useCallback((file) => {
@@ -207,10 +181,13 @@ export default function FloorPlanWalker() {
         setImg({ url: c.toDataURL("image/jpeg", 0.9), w, h });
         setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]); setScale(null);
         setCurrentPlanId(null); setCurrentName(""); setSaveStatus(""); // a fresh photo is a new (unsaved) plan
-        historyRef.current = []; setCanUndo(false);
+        resetHistory();
       };
+      im.onerror = () => { setError(FILE_ERROR); setErrorRetry(false); };
       im.src = e.target.result;
     };
+    reader.onerror = () => { setError(FILE_ERROR); setErrorRetry(false); };
+    if (!file || (file.type && !file.type.startsWith("image/"))) { setError(FILE_ERROR); setErrorRetry(false); return; }
     reader.readAsDataURL(file);
   }, []);
 
@@ -225,24 +202,12 @@ export default function FloorPlanWalker() {
     const base64 = img.url.split(",")[1];
     try {
       const p = await traceWithClaude({ apiKey, base64, width: img.w, height: img.h });
-      // walls: 5th element (conf 0–1) is optional/additive — older 4-element responses default to confident
-      const nw = (p.w || []).filter(a => Array.isArray(a) && a.length >= 4)
-        .map(a => ({ id: nid(), x1: a[0], y1: a[1], x2: a[2], y2: a[3], conf: (a.length >= 5 && isFinite(a[4])) ? Math.max(0, Math.min(1, a[4])) : 1 }));
-      const no = [
-        ...(p.d || []).map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 30, type: "door" })),
-        ...(p.win || []).map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 30, type: "window" })),
-      ];
-      // furniture / stairs / rooms are additive: older responses omit them and still work
-      const nf = (p.furn || []).filter(a => Array.isArray(a) && a.length >= 5)
-        .map(a => ({ id: nid(), type: String(a[0] || "other"), x: a[1], y: a[2], w: a[3] || 24, h: a[4] || 24, deg: a[5] || 0 }));
-      const ns = (p.stairs || []).filter(a => Array.isArray(a) && a.length >= 4)
-        .map(a => ({ id: nid(), x: a[0], y: a[1], w: a[2] || 40, h: a[3] || 60, deg: a[4] || 0 }));
-      const nr = (p.rooms || []).filter(a => Array.isArray(a) && a.length >= 3)
-        .map(a => ({ id: nid(), name: String(a[0] || ""), x: a[1], y: a[2] }));
-      setWalls(nw); setOpenings(no); setFurniture(nf); setStairs(ns); setRooms(nr);
-      if (p.scale && p.scale.px && p.scale.len) {
-        setScale({ pixelsPerUnit: p.scale.px / p.scale.len, unit: p.scale.unit === "m" ? "m" : "ft" });
-      }
+      // every number is checked and clamped, and list sizes are capped (src/planio.js)
+      const q = planFromModel(p, img.w, img.h);
+      pushHistory();
+      setWalls(q.walls); setOpenings(q.openings); setFurniture(q.furniture); setStairs(q.stairs); setRooms(q.rooms);
+      if (q.scale) setScale(q.scale);
+      const nw = q.walls;
       if (!nw.length) { setError(TRACE_ERRORS.unreadable.msg); setErrorRetry(true); }
       setStage("editor");
     } catch (err) {
@@ -252,7 +217,7 @@ export default function FloorPlanWalker() {
       // editor with the photo underneath, so the walls can still be traced by hand.
       setStage(["nokey", "badkey", "nocredit", "permission"].includes(code) ? "upload" : "editor");
     }
-  }, [img]);
+  }, [img, pushHistory]);
 
   const loadSample = useCallback(() => {
     // simple 2-bed shell sized for a 1024-wide canvas
@@ -291,7 +256,7 @@ export default function FloorPlanWalker() {
     ]);
     setScale({ pixelsPerUnit: 1024 / 12, unit: "m" }); // assume 12 m wide
     setCurrentPlanId(null); setCurrentName(""); setSaveStatus("");
-    historyRef.current = []; setCanUndo(false);
+    resetHistory();
     setStage("editor");
   }, []);
 
@@ -328,7 +293,7 @@ export default function FloorPlanWalker() {
     setWalls([]); setOpenings([]); setFurniture([]); setStairs([]); setRooms([]);
     setScale({ pixelsPerUnit: PXFT, unit: "ft" }); // 1 square = 1 ft, baked in
     setCurrentPlanId(null); setCurrentName(""); setSaveStatus("");
-    historyRef.current = []; setCanUndo(false);
+    resetHistory();
     setStage("editor");
   }, []);
 
@@ -350,22 +315,24 @@ export default function FloorPlanWalker() {
       if (tryPersist(next)) setSaveStatus("Saved (without the photo, to save space).");
       else { setSaveStatus("Storage is full — delete a saved plan and try again."); return; }
     }
-    setSavedPlans(next); setCurrentPlanId(id); setCurrentName(entry.name);
+    setSavedPlans(next); setCurrentPlanId(id); setCurrentName(entry.name); setDirty(false);
   }, [img, walls, openings, furniture, stairs, rooms, scale, ceiling, tidy, currentPlanId, savedPlans]);
 
-  // Open a saved plan back into the editor (or straight into the walk). Re-id every piece via nid()
-  // so the session's id counter can never collide with ids saved in a previous session.
-  const openPlan = useCallback((entry, walk) => {
-    const p = entry.plan || {};
-    const remap = (arr) => (arr || []).map((o) => ({ ...o, id: nid() }));
-    setImg(p.img || null);
-    setWalls(remap(p.walls)); setOpenings(remap(p.openings));
-    setFurniture(remap(p.furniture)); setStairs(remap(p.stairs)); setRooms(remap(p.rooms));
-    setScale(p.scale || null); setCeiling(p.ceiling ?? CEILING_FT_DEFAULT); setTidy(p.tidy ?? true);
-    setCurrentPlanId(entry.id); setCurrentName(entry.name); setSaveStatus(""); setError(null);
-    historyRef.current = []; setCanUndo(false);
-    setStage(walk && (p.walls || []).length >= 3 ? "walk" : "editor");
+  // Load a plan into the editor (or straight into the walk). Every plan from storage, a file or a
+  // share link goes through cleanSavedPlan, which re-ids every piece (so ids saved in an earlier
+  // session can't collide) and checks every number.
+  const loadPlan = useCallback((raw, { id = null, name = "", walk = false } = {}) => {
+    const p = cleanSavedPlan(raw);
+    if (!p) { setError("That plan couldn't be opened. It may be damaged."); setErrorRetry(false); return false; }
+    setImg(p.img);
+    setWalls(p.walls); setOpenings(p.openings); setFurniture(p.furniture); setStairs(p.stairs); setRooms(p.rooms);
+    setScale(p.scale); setCeiling(p.ceiling); setTidy(p.tidy);
+    setCurrentPlanId(id); setCurrentName(name); setSaveStatus(""); setError(null);
+    resetHistory();
+    setStage(walk && p.walls.length >= 3 ? "walk" : "editor");
+    return true;
   }, []);
+  const openPlan = useCallback((entry, walk) => loadPlan(entry.plan, { id: entry.id, name: entry.name, walk }), [loadPlan]);
 
   const renamePlan = useCallback((id, name) => {
     const clean = (name || "").trim(); if (!clean) return;
@@ -384,14 +351,18 @@ export default function FloorPlanWalker() {
     >
       <div className="min-h-screen w-full" style={{ background: "radial-gradient(1200px 600px at 70% -10%, #2a1f5e 0%, #15122e 45%, #0c0a1f 100%)" }}>
         {showIntro && <Welcome onClose={closeIntro} />}
+        {dialog && <Dialog {...dialog} onClose={(v) => { dialog.resolve(v); setDialog(null); }} />}
         <Header stage={stage} onHelp={() => setShowIntro(true)} />
         {stage === "upload" && (
           <Upload img={img} onFile={ingest} onAnalyze={analyze} onSample={loadSample} onBlank={startBlank}
-            onReset={() => { setImg(null); setError(null); }}
+            onReset={async () => {
+              if (dirty && !(await ask({ title: "Start over?", body: "This plan has changes that aren't saved. Save it first if you want to keep it.", confirmLabel: "Start over", danger: true }))) return;
+              setImg(null); setError(null); resetHistory();
+            }}
             onSkip={() => { setError(null); setStage("editor"); }}
             onKeyChange={() => setError(null)}
             error={error}
-            savedPlans={savedPlans} onOpenPlan={openPlan} onRenamePlan={renamePlan} onDeletePlan={deletePlan} />
+            savedPlans={savedPlans} onOpenPlan={openPlan} onRenamePlan={renamePlan} onDeletePlan={deletePlan} ask={ask} />
         )}
         {stage === "analyzing" && <Analyzing />}
         {stage === "editor" && (
@@ -411,8 +382,43 @@ export default function FloorPlanWalker() {
           />
         )}
         {stage === "walk" && (
-          <Walk walls={tidied} openings={openings} furniture={furniture} stairs={stairs} rooms={rooms} scale={scale} ceiling={ceiling} onExit={() => setStage("editor")} />
+          <Suspense fallback={<div className="py-24 text-center text-slate-300">Building your space…</div>}>
+            <Walk walls={tidied} openings={openings} furniture={furniture} stairs={stairs} rooms={rooms} scale={scale} ceiling={ceiling} onExit={() => setStage("editor")} />
+          </Suspense>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- in-app dialog (confirm, or ask for a short text) ----------
+// onClose(value): confirm -> true (or the typed text), cancel -> false/null.
+function Dialog({ title, body, input, confirmLabel = "OK", cancelLabel = "Cancel", danger = false, onClose }) {
+  const [text, setText] = useState(input ?? "");
+  const okRef = useRef(null), inRef = useRef(null);
+  const asksText = input !== undefined;
+  const ok = () => onClose(asksText ? (text.trim() || null) : true);
+  useEffect(() => {
+    (asksText ? inRef.current : okRef.current)?.focus();
+    const onKey = (e) => { if (e.key === "Escape") onClose(asksText ? null : false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-5" style={{ background: "rgba(8,6,20,0.72)" }} onClick={() => onClose(asksText ? null : false)}>
+      <div role="dialog" aria-modal="true" aria-labelledby="bw-dialog-title" className="w-full max-w-sm rounded-2xl p-5"
+        style={{ background: "#15122e", border: "1px solid rgba(255,255,255,0.12)" }} onClick={(e) => e.stopPropagation()}>
+        <h2 id="bw-dialog-title" className="text-base font-semibold text-slate-100 mb-1.5">{title}</h2>
+        {body && <p className="text-sm text-slate-300 mb-4">{body}</p>}
+        {asksText && (
+          <input ref={inRef} value={text} onChange={(e) => setText(e.target.value)} maxLength={40}
+            onKeyDown={(e) => { if (e.key === "Enter") ok(); }} aria-label={title}
+            className="w-full px-3 py-2.5 mb-4 rounded-lg text-sm text-slate-100 outline-none" style={{ background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.15)" }} />
+        )}
+        <div className="flex gap-2 justify-end">
+          <button onClick={() => onClose(asksText ? null : false)} className="min-h-11 px-4 rounded-lg text-sm text-slate-200" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>{cancelLabel}</button>
+          <button ref={okRef} onClick={ok} className="min-h-11 px-4 rounded-lg text-sm font-semibold text-white" style={{ background: danger ? "#b4444e" : "#6d5ae6" }}>{confirmLabel}</button>
+        </div>
       </div>
     </div>
   );
@@ -478,7 +484,7 @@ function Header({ stage, onHelp }) {
 }
 
 // ---------- upload ----------
-function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, onKeyChange, error, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
+function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, onKeyChange, error, ask, savedPlans = [], onOpenPlan, onRenamePlan, onDeletePlan }) {
   const fileRef = useRef(null), camRef = useRef(null);
   const [drag, setDrag] = useState(false);
   const [hasKey, setHasKey] = useState(() => !!getKey());
@@ -490,6 +496,7 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
         <>
           <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight mb-2">Turn a drawing into a space you can walk through.</h1>
           <p className="text-slate-400 mb-7 text-sm">Take a photo of a floor plan — even a rough sketch on paper. We'll trace the walls for you, you fix anything that looks off, tell us the real size, then walk through your space.</p>
+          {error && <div role="alert" className="mb-5 text-sm rounded-lg px-3 py-2" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.35)", color: "#fde68a" }}>{error}</div>}
           <div
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
             onDragLeave={() => setDrag(false)}
@@ -525,8 +532,8 @@ function Upload({ img, onFile, onAnalyze, onSample, onBlank, onReset, onSkip, on
                       <div className="flex items-center gap-1.5">
                         <button onClick={() => onOpenPlan?.(p, false)} className="flex-1 px-2 py-1 rounded text-xs font-medium text-white" style={{ background: "#6d5ae6" }}>Open</button>
                         <button onClick={() => onOpenPlan?.(p, true)} title="Walk it now" className="px-2 py-1 rounded text-xs text-white" style={{ background: "rgba(124,255,203,0.16)", border: "1px solid rgba(124,255,203,0.4)" }}>Walk</button>
-                        <button onClick={() => { const n = window.prompt("Rename this plan:", p.name); if (n != null) onRenamePlan?.(p.id, n); }} title="Rename" className="px-2 py-1 rounded text-xs text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>✎</button>
-                        <button onClick={() => { if (window.confirm(`Delete “${p.name}”? This can't be undone.`)) onDeletePlan?.(p.id); }} title="Delete" className="px-2 py-1 rounded text-xs" style={{ background: "rgba(180,68,78,0.18)", border: "1px solid rgba(180,68,78,0.4)", color: "#ffb4ba" }}>🗑</button>
+                        <button onClick={async () => { const n = await ask({ title: "Rename this plan", input: p.name, confirmLabel: "Rename" }); if (n) onRenamePlan?.(p.id, n); }} title="Rename" className="px-2 py-1 rounded text-xs text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>✎</button>
+                        <button onClick={async () => { if (await ask({ title: `Delete “${p.name}”?`, body: "This can't be undone.", confirmLabel: "Delete", danger: true })) onDeletePlan?.(p.id); }} title="Delete" className="px-2 py-1 rounded text-xs" style={{ background: "rgba(180,68,78,0.18)", border: "1px solid rgba(180,68,78,0.4)", color: "#ffb4ba" }}>🗑</button>
                       </div>
                     </div>
                   </div>
@@ -1293,7 +1300,7 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
       </div>
 
       <div className="mt-5 flex gap-3">
-        <button onClick={onBack} className="px-4 py-2 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>← New plan</button>
+        <button onClick={onBack} className="px-4 py-2 rounded-lg text-sm text-slate-300" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)" }}>← Back</button>
         <button onClick={onWalk} disabled={walls.length < 3}
           className="px-5 py-2 rounded-lg text-sm font-semibold text-white ml-auto"
           style={{ background: walls.length < 3 ? "rgba(255,255,255,0.1)" : "#6d5ae6" }}>
@@ -1301,346 +1308,6 @@ function Editor({ img, walls, setWalls, tidied = [], tidy = false, setTidy, open
         </button>
       </div>
       <p className="text-xs text-slate-500 mt-2">Tip: when adding or reshaping a wall, its end snaps onto a nearby corner (a ring shows the join). Pinch to zoom, twist two fingers to spin the view, and use ↶ Undo (or Ctrl/Cmd+Z) to take back the last change.</p>
-    </div>
-  );
-}
-
-// ================= 3D WALK =================
-function Walk({ walls, openings, furniture = [], stairs = [], rooms = [], scale, ceiling, onExit }) {
-  const mountRef = useRef(null);
-  const miniRef = useRef(null);
-  const [locked, setLocked] = useState(false);
-  const touchMove = useRef({ x: 0, y: 0 }); // left stick → move (read in tick)
-  const lookMove = useRef({ x: 0, y: 0 });  // right stick → look (read in tick)
-
-  // Lock the page while walking: on mobile a look-drag would otherwise scroll/rubber-band the
-  // whole page, sliding the fixed joystick out from under your thumb.
-  useEffect(() => {
-    const { body } = document, html = document.documentElement;
-    const prevOverflow = body.style.overflow, prevOverscroll = html.style.overscrollBehavior;
-    body.style.overflow = "hidden";
-    html.style.overscrollBehavior = "none";
-    return () => { body.style.overflow = prevOverflow; html.style.overscrollBehavior = prevOverscroll; };
-  }, []);
-
-  useEffect(() => {
-    const mount = mountRef.current;
-    const W = mount.clientWidth, H = mount.clientHeight;
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
-    renderer.setSize(W, H);
-    renderer.setClearColor(0x0c0a1f);
-    mount.appendChild(renderer.domElement);
-
-    const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x0c0a1f, 8, 60);
-    const camera = new THREE.PerspectiveCamera(72, W / H, 0.05, 200);
-    camera.rotation.order = "YXZ";
-    camera.position.set(0, EYE_M, 0);
-
-    // lights
-    scene.add(new THREE.HemisphereLight(0xcdd6ff, 0x202036, 0.9));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.7); dir.position.set(6, 14, 4); scene.add(dir);
-    scene.add(new THREE.AmbientLight(0x4a4570, 0.4));
-
-    // --- build model in world meters, centered ---
-    const mPerPx = (scale ? (scale.unit === "ft" ? FT_TO_M : 1) / scale.pixelsPerUnit : (12 / 1024)); // fallback ≈12m wide
-    const ceilingM = ceiling * FT_TO_M; // ceiling prop is in feet; the 3D world is in meters
-    let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
-    walls.forEach((w) => { minx = Math.min(minx, w.x1, w.x2); maxx = Math.max(maxx, w.x1, w.x2); miny = Math.min(miny, w.y1, w.y2); maxy = Math.max(maxy, w.y1, w.y2); });
-    const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2;
-    const W2 = (px, py) => [(px - cx) * mPerPx, (py - cy) * mPerPx]; // → [x, z]
-
-    const wallMat = new THREE.MeshStandardMaterial({ color: 0xece9f5, roughness: 0.95, metalness: 0 });
-    const glassMat = new THREE.MeshStandardMaterial({ color: 0x9fd8ff, transparent: true, opacity: 0.28, roughness: 0.1 });
-    const collide = []; // {ax,az,bx,bz,ht}
-
-    function box(x1, z1, x2, z2, yb, yt, t, mat) {
-      const L = Math.hypot(x2 - x1, z2 - z1); if (L < 0.02) return;
-      const g = new THREE.BoxGeometry(L, yt - yb, t);
-      const m = new THREE.Mesh(g, mat);
-      m.position.set((x1 + x2) / 2, (yb + yt) / 2, (z1 + z2) / 2);
-      m.rotation.y = Math.atan2(-(z2 - z1), x2 - x1);
-      scene.add(m);
-    }
-
-    // group openings to nearest wall (in px), with along-distance + half width in meters
-    const owned = walls.map(() => []);
-    openings.forEach((o) => {
-      let bi = -1, bd = 1e9, bt = 0;
-      walls.forEach((w, i) => { const d = pointSeg(o.x, o.y, w.x1, w.y1, w.x2, w.y2); if (d.dist < bd) { bd = d.dist; bi = i; bt = d.t; } });
-      if (bi >= 0 && bd < 60) owned[bi].push({ t: bt, hw: (o.w * mPerPx) / 2, type: o.type });
-    });
-
-    walls.forEach((w, i) => {
-      const [ax, az] = W2(w.x1, w.y1), [bx, bz] = W2(w.x2, w.y2);
-      const L = Math.hypot(bx - ax, bz - az);
-      const ux = (bx - ax) / (L || 1), uz = (bz - az) / (L || 1);
-      const at = (d) => [ax + ux * d, az + uz * d];
-      const ops = owned[i].map((o) => ({ s: Math.max(0, o.t * L - o.hw), e: Math.min(L, o.t * L + o.hw), type: o.type })).sort((p, q) => p.s - q.s);
-      let cur = 0;
-      const solid = (s, e) => {
-        if (e - s < 0.03) return;
-        const [sx, sz] = at(s), [ex, ez] = at(e);
-        box(sx, sz, ex, ez, 0, ceilingM, WALL_T_M, wallMat);
-        collide.push({ ax: sx, az: sz, bx: ex, bz: ez, ht: WALL_T_M / 2 + 0.02 });
-      };
-      ops.forEach((op) => {
-        solid(cur, op.s);
-        const [sx, sz] = at(op.s), [ex, ez] = at(op.e);
-        if (op.type === "window") {
-          box(sx, sz, ex, ez, 0, WIN_SILL_M, WALL_T_M, wallMat);        // sill
-          box(sx, sz, ex, ez, WIN_TOP_M, ceilingM, WALL_T_M, wallMat); // header
-          box(sx, sz, ex, ez, WIN_SILL_M, WIN_TOP_M, WALL_T_M * 0.4, glassMat);
-          collide.push({ ax: sx, az: sz, bx: ex, bz: ez, ht: WALL_T_M / 2 + 0.02 }); // can't walk through glass
-        } else {
-          box(sx, sz, ex, ez, DOOR_TOP_M, ceilingM, WALL_T_M, wallMat); // lintel above door
-          // door span left walkable (no collision)
-        }
-        cur = op.e;
-      });
-      solid(cur, L);
-    });
-
-    // floor + grid
-    const fw = (maxx - minx) * mPerPx + 4, fh = (maxy - miny) * mPerPx + 4;
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(fw, fh), new THREE.MeshStandardMaterial({ color: 0x2c2a44, roughness: 1 }));
-    floor.rotation.x = -Math.PI / 2; floor.position.y = 0; scene.add(floor);
-    const grid = new THREE.GridHelper(Math.max(fw, fh), Math.round(Math.max(fw, fh)), 0x4a4570, 0x35324f);
-    grid.position.y = 0.01; scene.add(grid);
-
-    // --- furniture: simple blocks (visual only, walk-through) ---
-    furniture.forEach((f) => {
-      const spec = FURN_3D[f.type] || FURN_3D.other;
-      const [wx, wz] = W2(f.x, f.y);
-      const ww = Math.max(0.05, f.w * mPerPx), wd = Math.max(0.05, f.h * mPerPx);
-      const m = new THREE.Mesh(new THREE.BoxGeometry(ww, spec.h, wd),
-        new THREE.MeshStandardMaterial({ color: spec.color, roughness: 0.85 }));
-      m.position.set(wx, spec.h / 2, wz);
-      m.rotation.y = -((f.deg || 0) * Math.PI) / 180;
-      scene.add(m);
-    });
-
-    // --- staircase: stepped block + footprint collision (non-walkable) ---
-    stairs.forEach((s) => {
-      const [wx, wz] = W2(s.x, s.y);
-      const ww = Math.max(0.1, s.w * mPerPx), wd = Math.max(0.1, s.h * mPerPx);
-      const a = -((s.deg || 0) * Math.PI) / 180;
-      const grp = new THREE.Group(); grp.position.set(wx, 0, wz); grp.rotation.y = a;
-      const N = 6, topH = Math.min(ceilingM * 0.95, 1.4), depth = wd / N;
-      const stepMat = new THREE.MeshStandardMaterial({ color: 0xc8895a, roughness: 0.9 });
-      for (let i = 0; i < N; i++) {
-        const h = (topH * (i + 1)) / N;
-        const m = new THREE.Mesh(new THREE.BoxGeometry(ww, h, depth), stepMat);
-        m.position.set(0, h / 2, -wd / 2 + depth * (i + 0.5));
-        grp.add(m);
-      }
-      scene.add(grp);
-      const co = Math.cos(a), si = Math.sin(a), hw = ww / 2, hd = wd / 2;
-      const corner = (lx, lz) => [wx + lx * co + lz * si, wz - lx * si + lz * co]; // Three.js Y-rotation
-      const c1 = corner(-hw, -hd), c2 = corner(hw, -hd), c3 = corner(hw, hd), c4 = corner(-hw, hd);
-      [[c1, c2], [c2, c3], [c3, c4], [c4, c1]].forEach(([p, q]) =>
-        collide.push({ ax: p[0], az: p[1], bx: q[0], bz: q[1], ht: WALL_T_M / 2 + 0.02 }));
-    });
-
-    // --- floating room-name labels (always visible, for orientation) ---
-    function makeLabel(text) {
-      const fontPx = 48, pad = 22;
-      const c = document.createElement("canvas");
-      let ctx = c.getContext("2d");
-      ctx.font = `600 ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
-      c.width = Math.ceil(ctx.measureText(text).width) + pad * 2; c.height = fontPx + pad * 2;
-      ctx = c.getContext("2d");
-      ctx.font = `600 ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
-      ctx.fillStyle = "rgba(12,10,31,0.6)"; ctx.fillRect(0, 0, c.width, c.height);
-      ctx.fillStyle = "#ece9f5"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-      ctx.fillText(text, c.width / 2, c.height / 2);
-      const tex = new THREE.CanvasTexture(c); tex.anisotropy = 4;
-      const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0.9, depthTest: false }));
-      spr.scale.set(c.width * 0.0028, c.height * 0.0028, 1); spr.renderOrder = 10;
-      return spr;
-    }
-    rooms.forEach((r) => {
-      if (!r.name) return;
-      const [wx, wz] = W2(r.x, r.y);
-      const spr = makeLabel(r.name); spr.position.set(wx, 1.85, wz); scene.add(spr);
-    });
-
-    // (camera spawn is set after the collision resolver is defined)
-
-    // ---- collision resolve (player radius) ----
-    const R = 0.26;
-    function resolve(px, pz) {
-      let x = px, z = pz;
-      for (let it = 0; it < 3; it++) {
-        for (const s of collide) {
-          const d = pointSeg(x, z, s.ax, s.az, s.bx, s.bz);
-          const min = R + s.ht;
-          if (d.dist < min) {
-            const nx = (x - d.cx) / (d.dist || 1e-4), nz = (z - d.cy) / (d.dist || 1e-4);
-            x = d.cx + nx * min; z = d.cy + nz * min;
-          }
-        }
-      }
-      return [x, z];
-    }
-
-    // spawn at footprint center, pushed out of any wall it lands on
-    {
-      const [sx0, sz0] = resolve(0, 0);
-      camera.position.set(sx0, EYE_M, sz0);
-    }
-
-    // ---- input ----
-    let yaw = camera.rotation.y, pitch = 0;
-    const keys = {};
-    const onKey = (v) => (e) => { keys[e.code] = v; };
-    const kd = onKey(true), ku = onKey(false);
-    window.addEventListener("keydown", kd); window.addEventListener("keyup", ku);
-
-    const onMouse = (e) => {
-      if (document.pointerLockElement !== renderer.domElement) return;
-      yaw -= e.movementX * 0.0024; pitch -= e.movementY * 0.0024;
-      pitch = Math.max(-1.45, Math.min(1.45, pitch));
-      camera.rotation.set(pitch, yaw, 0, "YXZ");
-    };
-    document.addEventListener("mousemove", onMouse);
-    const clickLock = () => renderer.domElement.requestPointerLock();
-    renderer.domElement.addEventListener("click", clickLock);
-    const onLockChange = () => setLocked(document.pointerLockElement === renderer.domElement);
-    document.addEventListener("pointerlockchange", onLockChange);
-
-    // Touch look is driven by the right joystick (lookMove ref), applied per-frame in tick().
-
-    // ---- minimap ----
-    const mini = miniRef.current;
-    const mctx = mini?.getContext("2d");
-    function minimap() {
-      if (!mctx) return;
-      const s = 150, pad = 10; mini.width = s; mini.height = s;
-      mctx.clearRect(0, 0, s, s);
-      mctx.fillStyle = "rgba(12,10,31,0.7)"; mctx.fillRect(0, 0, s, s);
-      const spanX = (maxx - minx) * mPerPx, spanZ = (maxy - miny) * mPerPx;
-      const sc = (s - pad * 2) / Math.max(spanX, spanZ, 1);
-      const ox = s / 2, oz = s / 2;
-      const P = (x, z) => [ox + x * sc, oz + z * sc];
-      mctx.strokeStyle = "#8b78ff"; mctx.lineWidth = 1.5;
-      collide.forEach((c) => { const [x1, y1] = P(c.ax, c.az), [x2, y2] = P(c.bx, c.bz); mctx.beginPath(); mctx.moveTo(x1, y1); mctx.lineTo(x2, y2); mctx.stroke(); });
-      const [pxp, pzp] = P(camera.position.x, camera.position.z);
-      mctx.fillStyle = "#7CFFCB"; mctx.beginPath(); mctx.arc(pxp, pzp, 3.5, 0, 7); mctx.fill();
-      mctx.strokeStyle = "#7CFFCB"; mctx.beginPath(); mctx.moveTo(pxp, pzp);
-      mctx.lineTo(pxp + Math.sin(yaw) * -10, pzp + Math.cos(yaw) * -10); mctx.stroke();
-    }
-
-    // ---- loop ----
-    const up = new THREE.Vector3(0, 1, 0);
-    const clock = new THREE.Clock();
-    let raf;
-    function tick() {
-      raf = requestAnimationFrame(tick);
-      const dt = Math.min(0.05, clock.getDelta());
-      const run = keys["ShiftLeft"] || keys["ShiftRight"];
-      const speed = (run ? 5.2 : 2.6);
-      const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
-      const right = new THREE.Vector3().crossVectors(fwd, up).normalize();
-      const mv = new THREE.Vector3();
-      if (keys["KeyW"] || keys["ArrowUp"]) mv.add(fwd);
-      if (keys["KeyS"] || keys["ArrowDown"]) mv.sub(fwd);
-      if (keys["KeyD"] || keys["ArrowRight"]) mv.add(right);
-      if (keys["KeyA"] || keys["ArrowLeft"]) mv.sub(right);
-      mv.add(fwd.clone().multiplyScalar(-touchMove.current.y));
-      mv.add(right.clone().multiplyScalar(touchMove.current.x));
-      if (mv.lengthSq() > 0) {
-        mv.normalize().multiplyScalar(speed * dt);
-        const [nx, nz] = resolve(camera.position.x + mv.x, camera.position.z + mv.z);
-        camera.position.x = nx; camera.position.z = nz;
-      }
-      camera.position.y = EYE_M;
-      // right joystick → look: stick deflection sets the turn rate (like a console controller)
-      const lk = lookMove.current;
-      if (lk.x || lk.y) {
-        yaw -= lk.x * 2.6 * dt;
-        pitch = Math.max(-1.45, Math.min(1.45, pitch - lk.y * 1.9 * dt));
-        camera.rotation.set(pitch, yaw, 0, "YXZ");
-      }
-      minimap();
-      renderer.render(scene, camera);
-    }
-    tick();
-
-    const onResize = () => {
-      const w = mount.clientWidth, h = mount.clientHeight;
-      camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h);
-    };
-    window.addEventListener("resize", onResize);
-
-    return () => {
-      cancelAnimationFrame(raf);
-      window.removeEventListener("keydown", kd); window.removeEventListener("keyup", ku);
-      document.removeEventListener("mousemove", onMouse);
-      document.removeEventListener("pointerlockchange", onLockChange);
-      window.removeEventListener("resize", onResize);
-      renderer.domElement.removeEventListener("click", clickLock);
-      if (document.pointerLockElement) document.exitPointerLock();
-      renderer.dispose();
-      mount.removeChild(renderer.domElement);
-    };
-  }, [walls, openings, furniture, stairs, rooms, scale, ceiling]);
-
-  // ---- twin touch joysticks: left = move, right = look ----
-  // One handler drives both. targetTouches scopes to the finger that landed on *this* stick,
-  // so the two sticks work independently with two thumbs. The nub follows the thumb for feel.
-  const moveBase = useRef(null), moveNub = useRef(null);
-  const lookBase = useRef(null), lookNub = useRef(null);
-  const NUB_TRAVEL = 36; // px the nub can slide from center
-  const drive = (base, nub, out) => (e) => {
-    const t = e.targetTouches[0];
-    if (!t) { out.current = { x: 0, y: 0 }; if (nub.current) nub.current.style.transform = "translate(-50%,-50%)"; return; }
-    const r = base.current.getBoundingClientRect();
-    let dx = (t.clientX - (r.left + r.width / 2)) / (r.width / 2);
-    let dy = (t.clientY - (r.top + r.height / 2)) / (r.height / 2);
-    const m = Math.hypot(dx, dy); if (m > 1) { dx /= m; dy /= m; }
-    out.current = { x: dx, y: dy };
-    if (nub.current) nub.current.style.transform = `translate(calc(-50% + ${dx * NUB_TRAVEL}px), calc(-50% + ${dy * NUB_TRAVEL}px))`;
-  };
-  const onMoveStick = drive(moveBase, moveNub, touchMove);
-  const onLookStick = drive(lookBase, lookNub, lookMove);
-
-  return (
-    <div className="relative" style={{ height: "calc(100dvh - 53px)", touchAction: "none", overscrollBehavior: "none" }}>
-      <div ref={mountRef} className="absolute inset-0" />
-      {/* crosshair */}
-      <div className="absolute left-1/2 top-1/2 pointer-events-none" style={{ transform: "translate(-50%,-50%)", width: 6, height: 6, borderRadius: 3, background: "rgba(255,255,255,0.7)" }} />
-      {/* minimap */}
-      <canvas ref={miniRef} className="absolute top-3 right-3 rounded-lg" style={{ width: 150, height: 150, border: "1px solid rgba(255,255,255,0.15)" }} />
-      {/* enter overlay */}
-      {!locked && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-6">
-          <div className="px-4 py-2.5 rounded-lg text-sm text-slate-200 text-center" style={{ background: "rgba(20,16,46,0.7)", border: "1px solid rgba(255,255,255,0.15)" }}>
-            <span className="sm:hidden">Left stick to walk · right stick to look around</span>
-            <span className="hidden sm:inline">Click to look around · <b>W A S D</b> move · <b>Shift</b> run · <b>Esc</b> release</span>
-          </div>
-        </div>
-      )}
-      {/* exit */}
-      <button onClick={onExit} className="absolute top-3 left-3 px-3 py-1.5 rounded-lg text-sm text-slate-200"
-        style={{ background: "rgba(20,16,46,0.8)", border: "1px solid rgba(255,255,255,0.15)" }}>← Edit plan</button>
-      {/* twin touch joysticks (mobile): left = move, right = look */}
-      <Stick label="move" baseRef={moveBase} nubRef={moveNub} onTouch={onMoveStick} side="left" />
-      <Stick label="look" baseRef={lookBase} nubRef={lookNub} onTouch={onLookStick} side="right" />
-    </div>
-  );
-}
-
-// One on-screen joystick. Pinned above the home-indicator safe area; mobile only.
-function Stick({ label, baseRef, nubRef, onTouch, side }) {
-  return (
-    <div ref={baseRef}
-      onTouchStart={onTouch} onTouchMove={onTouch} onTouchEnd={onTouch} onTouchCancel={onTouch}
-      className={`absolute rounded-full sm:hidden ${side === "left" ? "left-6" : "right-6"}`}
-      style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)", width: 120, height: 120, background: "rgba(124,99,255,0.12)", border: "1px solid rgba(124,99,255,0.4)", touchAction: "none" }}>
-      <div ref={nubRef} className="absolute left-1/2 top-1/2 rounded-full" style={{ transform: "translate(-50%,-50%)", width: 46, height: 46, background: "rgba(124,99,255,0.55)" }} />
-      <span className="absolute left-1/2 rounded text-[10px] uppercase tracking-wide text-slate-300 pointer-events-none" style={{ transform: "translateX(-50%)", bottom: -18 }}>{label}</span>
     </div>
   );
 }
